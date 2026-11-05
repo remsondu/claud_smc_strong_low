@@ -1,43 +1,11 @@
 //+------------------------------------------------------------------+
-//|                                            lugo with snr.mq5     |
+//|                                            SMC_LuxAlgo_EA.mq5    |
 //|                                                                  |
 //|  Smart Money Concepts EA  —  MT5 / MQL5 port of:                 |
 //|  "Smart Money Concepts [LuxAlgo]" Pine v5 indicator (TradingView)|
 //|                                                                  |
-//|  v1.24 — Per-TF levels draw only on their own chart TF by default |
-//|          (InpShowCurrentTFOnly) — declutters multi-TF levels.      |
-//|  v1.23 — Liquidity sweep targets now PER TIMEFRAME (own engine +  |
-//|          per-TF backfill; each target tagged with its source TF). |
-//|  v1.22 — Liquidity sweep targets: internal CHoCH/BOS that leaves  |
-//|          the major swing intact flags the origin high/low as the  |
-//|          level likely to be broken next.                          |
-//|  v1.21 — Invalidation levels now PER TIMEFRAME: each scanned TF   |
-//|          shows its own buy/sell level (panel + lines); gate TF    |
-//|          sets the trade block.                                    |
-//|  v1.20 — Invalidation auto-track: levels follow the context-TF   |
-//|          trendline + market structure (or S/R), with ATR buffer. |
-//|  v1.19 — Manual invalidation levels: buys blocked at/below a set |
-//|          price, sells at/above; drawn, gates TryEnter (not FBC). |
-//|  v1.18 — Merged MTF trendline status table (per-TF bull/bear     |
-//|          trendline HOLD/BRK + weighted NET BIAS).                |
-//|  v1.17 — FBC: every completed pattern on a tradable TF opens a   |
-//|          trade (entry no longer consults InpFBC_EntryMode).      |
-//|          Notifications split: [SETUP] on completion, [TRIGGERED] |
-//|          /[FAILED] on the entry — never confusable again.        |
-//|  v1.16 — Mirrored BUY side: failed BEARISH CHoCH (no new LL)    |
-//|          -> HL -> bullish break = BUY. Sell/buy toggles,         |
-//|          opposing higher-TF setup blocker, 2-sided panel         |
-//|  v1.15 — FBC sells auto-trade by default (own switch, does not   |
-//|          need InpEnableTrading); trade/skip reasons logged       |
-//|  v1.14 — Failed-CHoCH module now scans ALL timeframes (M1–W1),  |
-//|          per-TF panel, any-TF / confluence entry modes           |
-//|  v1.13 — Failed Bullish CHoCH SELL module (MTF):                 |
-//|          • Bullish CHoCH that fails below the HH → LH → sell     |
-//|          • Context TF setup + entry TF trigger, own panel/alerts |
-//|  v1.12 — Ported "Smarter SnR" (© hanabil, MPL-2.0):              |
-//|          • Swing-HiLo S/R engine with zigzag pivot correction    |
-//|          • Pivot-based trendlines + break detection              |
-//|          • New signal sources + entry filters + dashboard        |
+//|  v1.13 — MTF liquidity-sequence tracker (inducement→OB→cont.)    |
+//|  v1.12 — MTF Strong/Weak high-low dashboard + reaction alerts    |
 //|  v1.11 — Fixed invisible internal OBs and HH/HL labels           |
 //|  v1.10 — Added historical backfill on init                       |
 //|                                                                  |
@@ -47,18 +15,11 @@
 //|  This is a DERIVATIVE WORK. Original © LuxAlgo.                  |
 //|  This port is also released under CC BY-NC-SA 4.0 — you may NOT  |
 //|  sell it (e.g. on the MQL5 Market) under the original license.   |
-//|                                                                  |
-//|  The S/R + trendline module is derived from "Smarter SnR"        |
-//|  © hanabil, licensed under Mozilla Public License 2.0            |
-//|  https://mozilla.org/MPL/2.0/  — notice preserved as required.   |
-//|  NOTE: MPL-2.0 and CC BY-NC-SA 4.0 are not straightforwardly     |
-//|  compatible. Keep this build private / non-distributed unless    |
-//|  you have sorted the licensing out.                              |
 //+------------------------------------------------------------------+
-#property copyright "© LuxAlgo + © hanabil (originals) — derivative port"
+#property copyright "© LuxAlgo (original) — derivative port under CC BY-NC-SA 4.0"
 #property link      "https://creativecommons.org/licenses/by-nc-sa/4.0/"
-#property version   "1.24"
-#property description "SMC EA — BOS/CHoCH, OB, FVG, EQH/EQL, MTF, P/D zones, Smart S/R + Trendlines, Failed-CHoCH sell+buy, auto-trade, backfill"
+#property version   "1.13"
+#property description "Smart Money Concepts EA — BOS/CHoCH, OB, FVG, EQH/EQL, MTF, P/D zones, auto-trade, MTF strong/weak dashboard, MTF liquidity-sequence tracker"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -72,7 +33,6 @@ enum ENUM_SMC_MITIGATION       { SMC_BY_CLOSE, SMC_BY_HIGHLOW };
 enum ENUM_SMC_STRUCT_DISPLAY   { SMC_ALL, SMC_BOS_ONLY, SMC_CHOCH_ONLY };
 enum ENUM_SMC_LINESTYLE        { SMC_SOLID, SMC_DASHED, SMC_DOTTED };
 enum ENUM_SMC_LABEL_SIZE       { SMC_TINY, SMC_SMALL, SMC_NORMAL };
-enum ENUM_TL_SOURCE            { TL_CLOSE_BODY, TL_SHADOW };
 enum ENUM_SMC_SIGNAL {
     SIG_INTERNAL_BOS,
     SIG_INTERNAL_CHOCH,
@@ -80,23 +40,22 @@ enum ENUM_SMC_SIGNAL {
     SIG_SWING_BOS,
     SIG_SWING_CHOCH,
     SIG_SWING_ANY,
-    SIG_TRENDLINE_BREAK,     // v1.12
-    SIG_SNR_BREAK,           // v1.12
     SIG_OFF
 };
-enum ENUM_SMC_SLMODE { SL_TRAILING_EXTREME, SL_LAST_PIVOT, SL_ATR, SL_SNR_LEVEL };
-// v1.20 — invalidation auto-track
-enum ENUM_INVAL_SOURCE {
-    INVAL_MANUAL,       // fixed prices (InpInvalBuyBelow / InpInvalSellAbove)
-    INVAL_SWING,        // context-TF market structure (last pivot low/high)
-    INVAL_TRENDLINE,    // context-TF bull/bear trendline from the MTF table
-    INVAL_SNR,          // nearest Smart S/R level (S below / R above)
-    INVAL_TL_AND_SWING  // trendline + structure combined (per InpInvalCombine)
-};
-enum ENUM_INVAL_COMBINE {
-    INVAL_WIDEST,       // level farther from price (more room before invalidating)
-    INVAL_TIGHTEST      // level nearer to price (invalidates sooner)
-};
+enum ENUM_SMC_SLMODE { SL_TRAILING_EXTREME, SL_LAST_PIVOT, SL_ATR };
+
+// v1.12: MTF dashboard reaction state
+enum ENUM_MTF_STATE { MTF_NONE, MTF_HOLD_BULL, MTF_HOLD_BEAR, MTF_BROKEN_HIGH, MTF_BROKEN_LOW };
+
+// v1.13: liquidity-sequence tracker phases (ordered — used for no-downgrade upgrades)
+//   IDLE → BREAK (CHoCH/BOS seeds setup) → RETRACE (price heads back to OB)
+//        → MITIGATED (price taps OB) → CONTINUATION (original move resumes) ; INVALID = OB blown
+enum ENUM_SEQ_STATE { SEQ_IDLE, SEQ_BREAK, SEQ_RETRACE, SEQ_MITIGATED, SEQ_CONTINUATION, SEQ_INVALID };
+
+// v1.13: which timeframes draw their chart objects
+//   CURRENT = only the sequence whose TF matches the chart you're on (each TF has its own visuals)
+//   ALL     = project every tracked TF's levels onto the current chart (old behaviour)
+enum ENUM_LIQ_SCOPE { LIQ_SCOPE_CURRENT, LIQ_SCOPE_ALL };
 
 //============================ CONSTANTS =============================
 #define BULLISH_LEG  1
@@ -110,9 +69,9 @@ enum ENUM_INVAL_COMBINE {
 
 #define OBJ_PREFIX       "SMC_"
 
-#define SNR_MAX_LEVELS   8
-#define ZZ_MAX_SEGMENTS  400
-#define DASH_MAX_LINES   14
+#define MTF_COUNT        4        // v1.12: number of timeframes in the dashboard
+#define LIQ_CH_COUNT     2        // v1.13: channels per TF — [0]=internal, [1]=swing/external
+#define LIQ_TF_MAX       (MTF_COUNT + 1)  // v1.13: MTF rows + optional current-chart row
 
 //============================== INPUTS ==============================
 input group "═══ GENERAL ═══"
@@ -189,40 +148,6 @@ input color  InpPremiumColor      = clrCrimson;
 input color  InpEquilibriumColor  = clrDimGray;
 input color  InpDiscountColor     = clrSeaGreen;
 
-//------------------- v1.12: SMART S/R (hanabil port) -----------------
-input group "═══ SMART S/R (Swing HiLo) ═══"
-input bool                InpShowSnR         = true;         // Show S/R levels
-input int                 InpSnRPeriod       = 20;           // Swing period (pivot left/right bars)
-input int                 InpSnRLevelCount   = 3;            // How many S / R levels (1-8)
-input bool                InpSnRShowPrice    = true;         // Show price labels
-input ENUM_SMC_LINESTYLE  InpSnRLineStyle    = SMC_SOLID;
-input int                 InpSnRLineWidth    = 1;
-input bool                InpSnRExtendRight  = false;        // Extend lines as a right-ray
-input color               InpSupportColor    = clrRed;       // Support (matches original)
-input color               InpResistanceColor = clrDodgerBlue;// Resistance (matches original)
-input bool                InpShowZigZag      = false;        // Draw corrected zigzag
-input color               InpZigZagColor     = clrDimGray;
-
-input group "═══ TRENDLINES ═══"
-input bool                InpShowTrendlines  = true;
-input int                 InpTLPeriod        = 20;           // Trendline pivot period
-input ENUM_TL_SOURCE      InpTLSource        = TL_CLOSE_BODY;// Close body vs shadow
-input ENUM_SMC_LINESTYLE  InpTLStyle         = SMC_DASHED;
-input int                 InpTLWidth         = 1;
-input color               InpTLColor         = clrDimGray;
-input bool                InpTLShowPrice     = true;         // Projected trendline price label
-input bool                InpTLExtendToNow   = true;         // Newest line always reaches current bar
-input bool                InpTLBreakMarkers  = true;         // Draw break arrows
-input bool                InpTLNewestBreakOnly = true;       // Keep only the latest break arrow
-
-input group "═══ S/R + TL FILTERS & PANEL ═══"
-input bool   InpUseSnRProximityFilter = false;   // Block entries into nearby S/R
-input double InpSnRProximityATR       = 0.75;    // "Nearby" = this × ATR(14)
-input bool   InpUseTLBiasFilter       = false;   // Long needs price above upper TL, short below lower TL
-input bool   InpAlertOnTLBreak        = true;
-input bool   InpAlertOnSnRCross       = false;
-input bool   InpShowDashboard         = true;    // On-chart S/R + TL readout
-
 input group "═══ TRADING (set EnableTrading=true to arm) ═══"
 input bool             InpEnableTrading      = false;       // Enable trading
 input ENUM_SMC_SIGNAL  InpSignalSource       = SIG_INTERNAL_CHOCH;  // Which signal triggers entry
@@ -241,43 +166,50 @@ input bool             InpTrailOnNewSwing    = true;        // Move SL to new sw
 input bool             InpAlertsOn           = true;        // Show alerts on signals
 input bool             InpPushNotifyOn       = false;       // Send push notifications
 
-input group "═══ MANUAL INVALIDATION LEVELS (v1.19) ═══"
-input bool   InpInvalEnable      = true;         // Enforce manual invalidation levels
-input double InpInvalBuyBelow    = 0.0;          // MANUAL mode: buys INVALID at/below this price (0 = off)
-input double InpInvalSellAbove   = 0.0;          // MANUAL mode: sells INVALID at/above this price (0 = off)
-input bool   InpInvalBlockTrades = true;         // Block entries while a level is breached
-input bool   InpInvalDrawLines   = true;         // Draw the levels on the chart
-input color  InpInvalBuyColor    = clrSeaGreen;  // Buy-invalidation line color
-input color  InpInvalSellColor   = clrCrimson;   // Sell-invalidation line color
+input group "═══ MTF STRONG/WEAK DASHBOARD ═══"
+input bool              InpShowMTFPanel   = true;            // Show MTF strong/weak panel
+input ENUM_TIMEFRAMES   InpMTF1           = PERIOD_M15;      // Row 1 timeframe
+input ENUM_TIMEFRAMES   InpMTF2           = PERIOD_H1;       // Row 2 timeframe
+input ENUM_TIMEFRAMES   InpMTF3           = PERIOD_H4;       // Row 3 timeframe
+input ENUM_TIMEFRAMES   InpMTF4           = PERIOD_D1;       // Row 4 timeframe
+input int               InpMTFSwingLength = 10;              // MTF pivot length (swing detection)
+input int               InpMTFScanBars    = 600;             // Bars scanned per timeframe
+input double            InpReactBufferATR = 0.5;             // Reaction zone = x * ATR(14) of chart TF
+input bool              InpMTFReactAlerts = true;            // Alert when a strong level HOLDS (reaction)
+input bool              InpMTFBreakAlerts = false;           // Alert when a strong level is BROKEN
+input ENUM_BASE_CORNER  InpPanelCorner    = CORNER_LEFT_UPPER; // Panel anchor corner
+input int               InpPanelX         = 14;              // Panel X offset (px from corner)
+input int               InpPanelY         = 20;              // Panel Y offset (px from corner)
+input int               InpPanelFontSize  = 8;               // Panel font size
+input color             InpPanelBullColor = clrSeaGreen;     // Bullish / strong-low color
+input color             InpPanelBearColor = clrCrimson;      // Bearish / strong-high color
+input color             InpPanelTextColor = clrGainsboro;    // Header / neutral text color
+input color             InpPanelDimColor  = C'90,92,100';    // Inactive value color
+input color             InpPanelBgColor   = C'28,30,36';     // Panel background color
+input bool              InpMTFHighlightInPlay = true;        // v1.13: highlight the TF row(s) price is currently trading within
+input color             InpMTFInPlayColor     = C'45,66,58';  // In-play row highlight background
+input color             InpMTFInPlayTagColor  = clrAqua;      // In-play TF tag color
 
-input group "═══ INVALIDATION AUTO-TRACK (v1.20) ═══"
-input ENUM_INVAL_SOURCE  InpInvalSource    = INVAL_TL_AND_SWING; // Where levels come from
-input ENUM_TIMEFRAMES    InpInvalCtxTF     = PERIOD_H4;          // GATE TF: which TF's level blocks trades
-input ENUM_INVAL_COMBINE InpInvalCombine   = INVAL_WIDEST;       // When TL & structure both exist, pick
-input double             InpInvalBufferATR = 0.5;                // Buffer beyond the auto level (x chart ATR14)
-input bool               InpShowCurrentTFOnly = true;            // Draw ONLY the current chart TF's levels (inval + sweep targets)
-
-input group "═══ LIQUIDITY SWEEP TARGETS (per-TF, v1.23) ═══"
-input bool   InpLST_Enable       = true;        // Flag highs/lows likely to be swept
-input bool   InpLST_CHoCHOnly    = false;       // Only minor CHoCH counts (not BOS) — cleaner sweeps
-input int    InpLST_MinorPivot   = 3;           // Minor pivot length (the sweeping break)
-input int    InpLST_MajorPivot   = 15;          // Major pivot length (structure that must stay intact)
-input bool   InpLST_ScanM5       = false;       // Scan M5
-input bool   InpLST_ScanM15      = true;        // Scan M15
-input bool   InpLST_ScanM30      = true;        // Scan M30
-input bool   InpLST_ScanH1       = true;        // Scan H1
-input bool   InpLST_ScanH4       = true;        // Scan H4
-input bool   InpLST_ScanD1       = true;        // Scan D1
-input bool   InpLST_ScanW1       = false;       // Scan W1
-input double InpLST_MinDistATR   = 0.0;         // Ignore targets closer than this x ATR14 (0 = off)
-input int    InpLST_MaxBars      = 300;         // Drop an un-hit target after N chart bars
-input int    InpLST_MaxTargets   = 10;          // Max live targets kept (all TFs)
-input int    InpLST_BackfillBars = 1500;        // Per-TF history replay on load
-input bool   InpLST_AlertOnNew   = true;        // Alert when a new sweep target is projected
-input bool   InpLST_AlertOnHit   = true;        // Alert when a target is reached
-input bool   InpLST_Draw         = true;        // Draw the target rays
-input color  InpLST_LowColor     = clrOrange;   // Low likely to break (downside target)
-input color  InpLST_HighColor    = clrMagenta;  // High likely to break (upside target)
+input group "═══ LIQUIDITY SEQUENCE TRACKER (v1.13) ═══"
+input bool              InpLiqEnable        = true;          // Enable inducement→OB→continuation tracker
+input bool              InpLiqTrackInternal = true;          // Track internal-structure sequences
+input bool              InpLiqTrackSwing    = true;          // Track swing/external-structure sequences
+input int               InpLiqIntLength     = 5;             // Internal pivot length (per TF)
+input int               InpLiqSwingLength   = 20;            // Swing/external pivot length (per TF)
+input int               InpLiqScanBars      = 600;           // Bars scanned per timeframe
+input int               InpLiqOBLookback    = 30;            // Max bars back from break to find the OB candle
+input double            InpLiqTapTolFrac    = 0.25;          // OB-tap tolerance as fraction of OB height
+input bool              InpLiqRequireSweep  = true;          // Require inducement sweep before a valid continuation
+input bool              InpLiqAlertBreak    = true;          // Alert when a new break seeds a sequence
+input bool              InpLiqAlertMitigate = true;          // Alert when price taps the OB
+input bool              InpLiqAlertContinue = true;          // Alert when the original move resumes (trigger)
+input bool              InpLiqDrawObjects   = true;          // Draw inducement level + OB + arrow on chart
+input bool              InpLiqIncludeCurrent= true;          // Also track the CURRENT chart timeframe as its own row
+input ENUM_LIQ_SCOPE    InpLiqDrawScope     = LIQ_SCOPE_CURRENT; // Chart objects: current TF only / all tracked TFs
+input color             InpLiqBullColor     = clrSeaGreen;   // Bullish sequence color
+input color             InpLiqBearColor     = clrCrimson;    // Bearish sequence color
+input color             InpLiqInduceColor   = clrGold;       // Inducement (left-behind) level color
+input int               InpLiqPanelGap      = 24;            // Gap (px) below MTF panel for the sequence panel
 
 //============================ STRUCTS ===============================
 struct Pivot {
@@ -318,25 +250,6 @@ struct TrailingEx {
 
 struct EqDisplay { long objId; };
 
-//---- v1.12 ----
-struct SnRLevel {
-    double   price;
-    datetime time;
-};
-
-struct ZZPoint {
-    double   price;
-    datetime time;
-    int      type;          // +1 high, -1 low
-};
-
-struct TLine {
-    bool     valid;
-    datetime t1;  double p1;
-    datetime t2;  double p2;
-    double   slope;         // price units per second
-};
-
 struct AlertFlags {
     bool internalBullishBOS;
     bool internalBearishBOS;
@@ -354,11 +267,57 @@ struct AlertFlags {
     bool equalLows;
     bool bullishFVG;
     bool bearishFVG;
-    // v1.12
-    bool tlBreakUp;
-    bool tlBreakDown;
-    bool snrBreakUp;
-    bool snrBreakDown;
+};
+
+// v1.12: one row of the MTF strong/weak dashboard
+struct MTFLevel {
+    ENUM_TIMEFRAMES tf;
+    string          tag;          // short name e.g. "H4"
+    bool            valid;
+    int             bias;         // BULLISH / BEARISH / NEUTRAL
+    double          swingHigh;    // current range extremes
+    double          swingLow;
+    double          strongHigh;   // the four named levels
+    double          weakHigh;
+    double          strongLow;
+    double          weakLow;
+    double          eqMid;
+    int             pricePD;      // +1 premium, -1 discount, 0 equilibrium
+    double          strongActive; // strong level in play for current bias
+    double          targetWeak;   // weak opposite = expected destination on a reject
+    bool            inPlay;       // v1.13: price currently sits inside this TF's strong↔weak band
+    ENUM_MTF_STATE  state;        // live reaction state (persists until changed)
+    datetime        lastReactBar; // debounce: last chart bar that fired a reaction alert
+};
+
+// v1.13: one tracked liquidity sequence = a single (timeframe × channel) slot.
+// It always reflects the MOST RECENT structure break on that TF/channel and the
+// progression of price afterward: break → leave inducement behind → push to OB →
+// tap OB → original move resumes. A newer opposite break simply reseeds the slot.
+struct LiqSequence {
+    ENUM_TIMEFRAMES tf;
+    string          tag;          // e.g. "H4"
+    bool            internalCh;   // true = internal, false = swing/external
+    int             dir;          // BULLISH(+1) / BEARISH(-1) of the break & intended continuation; 0 = none
+    ENUM_SEQ_STATE  state;
+
+    double          brokenPivot;  // the structural level the CHoCH/BOS broke
+    datetime        breakTime;    // HTF bar time at which the break closed
+    bool            isChoCH;      // true = CHoCH, false = BOS (context label)
+
+    double          induceLevel;  // the left-behind opposite pivot (inducement liquidity)
+    datetime        induceTime;
+    bool            induceSwept;  // has price run the inducement since the break
+
+    double          obTop, obBottom;  // order block zone (origin of the breaking leg)
+    datetime        obTime;
+    bool            obValid;
+
+    datetime        contBarTime;  // HTF bar that produced the continuation (trigger)
+
+    // alert debounce: last event bar time already signalled
+    datetime        aBreak, aMit, aCont;
+    bool            active;        // slot currently holds a live sequence
 };
 
 //============================ GLOBALS ===============================
@@ -413,31 +372,18 @@ long g_lastInternalLowStructObj  = 0;
 datetime g_initialTime = 0;
 
 // Backfill scan offset — added to every bar shift when > 0 (0 = live).
+// All bar accessors below respect this so the same logic can be replayed
+// over historical bars without copy-pasting it.
 int g_scanShift = 0;
 
-//---------------------- v1.12 SMART S/R STATE -----------------------
-SnRLevel g_res[];              // index 0 = R1 (most recent resistance)
-SnRLevel g_sup[];              // index 0 = S1 (most recent support)
-ZZPoint  g_zz[];               // corrected alternating zigzag
-int      g_zzSegments = 0;
+// v1.12: MTF dashboard state (one entry per tracked timeframe)
+MTFLevel g_mtf[MTF_COUNT];
 
-// Raw pivot bookkeeping for the zigzag correction
-int      g_lastRawType = 0;    // +1 = last raw pivot was a high, -1 = low
-datetime g_lastRawTime = 0;
-
-// Trendline pivot bookkeeping (separate period + source from S/R)
-double   g_tlPhVal  = 0.0, g_tlPhVal1  = 0.0;
-datetime g_tlPhTime = 0,   g_tlPhTime1 = 0;
-double   g_tlPlVal  = 0.0, g_tlPlVal1  = 0.0;
-datetime g_tlPlTime = 0,   g_tlPlTime1 = 0;
-
-TLine    g_upperTL, g_lowerTL;
-
-// Previous-bar trendline values (Pine's upperTl[1] / lowerTl[1])
-double   g_prevUpVal = 0.0, g_prevLoVal = 0.0;
-bool     g_hadUpPrev = false, g_hadLoPrev = false;
-
-long     g_tlBreakCounter = 0;
+// v1.13: liquidity-sequence tracker state — [timeframe][channel] (0=internal, 1=swing)
+LiqSequence     g_liq[LIQ_TF_MAX][LIQ_CH_COUNT];
+ENUM_TIMEFRAMES g_liqTF[LIQ_TF_MAX];    // tracked timeframes (MTF rows + optional current chart)
+int             g_liqTFCount = 0;       // how many rows are in use
+int             g_liqCurRow  = -1;      // row whose TF == current chart period (-1 if none)
 
 //===================== UTILITY: NAMES & STYLE =======================
 string MakeName(string suffix) {
@@ -473,24 +419,16 @@ color ResolveFVGBull() { return InpStyle == SMC_MONOCHROME ? C'215,217,222' : In
 color ResolveFVGBear() { return InpStyle == SMC_MONOCHROME ? C'160,163,172' : InpFVGBearColor; }
 color ResolvePremium() { return InpStyle == SMC_MONOCHROME ? C'93,96,107'   : InpPremiumColor; }
 color ResolveDiscount(){ return InpStyle == SMC_MONOCHROME ? C'178,181,190' : InpDiscountColor; }
-color ResolveSupport() { return InpStyle == SMC_MONOCHROME ? C'178,181,190' : InpSupportColor; }
-color ResolveResist()  { return InpStyle == SMC_MONOCHROME ? C'93,96,107'   : InpResistanceColor; }
 
 //===================== UTILITY: BAR ACCESS ==========================
 // Logical offset 0 = most recent CLOSED bar (shift 1 in MQL5).
+// During backfill, g_scanShift > 0 walks the "current closed bar" backward
+// through history so the same pivot/structure code can replay over old bars.
 double H(int off)         { return iHigh (_Symbol, _Period, off + 1 + g_scanShift); }
 double L(int off)         { return iLow  (_Symbol, _Period, off + 1 + g_scanShift); }
 double C_(int off)        { return iClose(_Symbol, _Period, off + 1 + g_scanShift); }
 double O_(int off)        { return iOpen (_Symbol, _Period, off + 1 + g_scanShift); }
 datetime T(int off)       { return iTime (_Symbol, _Period, off + 1 + g_scanShift); }
-
-// Convert a bar time back into a logical offset in the current scan frame.
-int OffsetOfTime(datetime t) {
-    if(t == 0) return -1;
-    int sh = iBarShift(_Symbol, _Period, t, false);
-    if(sh < 0) return -1;
-    return sh - 1 - g_scanShift;
-}
 
 double Highest(int size) {
     int idx = iHighest(_Symbol, _Period, MODE_HIGH, size, 1 + g_scanShift);
@@ -575,7 +513,10 @@ void DrawTrend(string name, datetime t1, double p1, datetime t2, double p2,
 }
 
 // NOTE (v1.11 fix): OBJ_RECTANGLE in MT5 uses OBJPROP_COLOR for both outline AND fill
-// when OBJPROP_FILL=true. OBJPROP_BGCOLOR is silently ignored on OBJ_RECTANGLE.
+// when OBJPROP_FILL=true. OBJPROP_BGCOLOR is silently ignored on OBJ_RECTANGLE — it
+// only applies to OBJ_RECTANGLE_LABEL / OBJ_EDIT / OBJ_BUTTON. So if a caller passes
+// border=CLR_NONE (intending a borderless filled box), the whole rectangle disappears.
+// We coerce border→fill in that case so the box always renders.
 void DrawRect(string name, datetime t1, double p1, datetime t2, double p2,
               color border, color fill, bool back = true) {
     if(ObjectFind(0, name) < 0)
@@ -584,7 +525,7 @@ void DrawRect(string name, datetime t1, double p1, datetime t2, double p2,
     ObjectMove(0, name, 1, t2, p2);
     color drawColor = (border == CLR_NONE) ? fill : border;
     ObjectSetInteger(0, name, OBJPROP_COLOR,      drawColor);
-    ObjectSetInteger(0, name, OBJPROP_BGCOLOR,    fill);   // kept for API symmetry
+    ObjectSetInteger(0, name, OBJPROP_BGCOLOR,    fill);   // kept for API symmetry; ignored by OBJ_RECTANGLE
     ObjectSetInteger(0, name, OBJPROP_FILL,       true);
     ObjectSetInteger(0, name, OBJPROP_BACK,       back);
     ObjectSetInteger(0, name, OBJPROP_STYLE,      STYLE_SOLID);
@@ -605,22 +546,6 @@ void DrawText(string name, datetime t, double p, string txt, color c, int fontSi
     ObjectSetInteger(0, name, OBJPROP_ANCHOR,  anchor);
     ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
     ObjectSetInteger(0, name, OBJPROP_HIDDEN,  true);
-}
-
-// v1.12 — Wingdings arrow marker (used for trendline breaks).
-// NOTE: OBJ_ARROW anchors use ENUM_ARROW_ANCHOR (only ANCHOR_TOP / ANCHOR_BOTTOM),
-// which is a DIFFERENT enum from the ENUM_ANCHOR_POINT used by OBJ_TEXT / OBJ_LABEL.
-// Typing this parameter as ENUM_ANCHOR_POINT is a compile error in MQL5.
-void DrawArrow(string name, datetime t, double p, int code, color c, ENUM_ARROW_ANCHOR anchor) {
-    if(ObjectFind(0, name) < 0)
-        ObjectCreate(0, name, OBJ_ARROW, 0, t, p);
-    ObjectMove(0, name, 0, t, p);
-    ObjectSetInteger(0, name, OBJPROP_ARROWCODE,  code);
-    ObjectSetInteger(0, name, OBJPROP_COLOR,      c);
-    ObjectSetInteger(0, name, OBJPROP_WIDTH,      1);
-    ObjectSetInteger(0, name, OBJPROP_ANCHOR,     anchor);
-    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-    ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
 }
 
 void SafeDelete(string name) {
@@ -658,12 +583,15 @@ int LegFunc(int size, int &prevLegOut, int &currentLegInOut) {
 }
 
 //===================== STRUCTURE / PIVOT CAPTURE ====================
+// Draws an "HH/HL/LH/LL" tag at a confirmed swing point.
+// Convention: below=true → label appears BELOW the price (anchor at text's UPPER edge).
 void DrawSwingPointLabel(datetime t, double price, string tag, color c, bool below) {
     string name = MakeName("swp");
     DrawText(name, t, price, tag, c, LabelFontSize(InpSwingLabelSize),
              below ? ANCHOR_UPPER : ANCHOR_LOWER);
 }
 
+// Draw an EQH / EQL line + label connecting two equal pivots
 void DrawEqualHighLow(Pivot &p, double level, int size, bool isHigh) {
     color c = isHigh ? ResolveSwingBear() : ResolveSwingBull();
     string tag = isHigh ? "EQH" : "EQL";
@@ -684,11 +612,13 @@ void DrawEqualHighLow(Pivot &p, double level, int size, bool isHigh) {
 
     DrawTrend(lineName, p.barTime, p.currentLevel, T(size), level, c, STYLE_DOT, 1, false);
 
+    // Place label centered between the two equal points
     datetime midT = (datetime)((long)p.barTime / 2 + (long)T(size) / 2);
     DrawText(textName, midT, level, tag, c, LabelFontSize(InpEQHEQLSize),
              isHigh ? ANCHOR_LOWER : ANCHOR_UPPER);
 }
 
+// Capture current structure: detect pivots at given size, optionally for "equal" / "internal" channels.
 void GetCurrentStructure(int size, bool equalMode, bool internalMode) {
     int prevLeg = 0, curLeg = 0;
     if(equalMode)         { curLeg = g_equalLeg;    prevLeg = g_equalLegPrev;   }
@@ -710,6 +640,7 @@ void GetCurrentStructure(int size, bool equalMode, bool internalMode) {
     double atr = GetATR(size);
 
     if(pivotLow) {
+        // pick the right pivot to update
         if(equalMode) {
             if(MathAbs(g_equalLow.currentLevel - L(size)) < InpEQHEQLThresh * atr && g_equalLow.currentLevel != 0.0) {
                 DrawEqualHighLow(g_equalLow, L(size), size, false);
@@ -741,6 +672,7 @@ void GetCurrentStructure(int size, bool equalMode, bool internalMode) {
 
             if(InpShowSwingPoints) {
                 string tag = g_swingLow.currentLevel < g_swingLow.lastLevel ? "LL" : "HL";
+                // v1.11 fix: label drawn BELOW the swing low (below=true → ANCHOR_UPPER).
                 DrawSwingPointLabel(T(size), L(size), tag, ResolveSwingBull(), true);
             }
         }
@@ -777,6 +709,7 @@ void GetCurrentStructure(int size, bool equalMode, bool internalMode) {
 
             if(InpShowSwingPoints) {
                 string tag = g_swingHigh.currentLevel > g_swingHigh.lastLevel ? "HH" : "LH";
+                // v1.11 fix: label drawn ABOVE the swing high (below=false → ANCHOR_LOWER).
                 DrawSwingPointLabel(T(size), H(size), tag, ResolveSwingBear(), false);
             }
         }
@@ -784,6 +717,7 @@ void GetCurrentStructure(int size, bool equalMode, bool internalMode) {
 }
 
 //===================== STRUCTURE DRAW ===============================
+// Render a BOS/CHoCH line + tag at center
 void DrawStructure(Pivot &p, string tag, color c, ENUM_LINE_STYLE st,
                    ENUM_SMC_LABEL_SIZE sz, bool labelBelow,
                    bool internalChannel, bool isLow) {
@@ -820,6 +754,7 @@ void DrawStructure(Pivot &p, string tag, color c, ENUM_LINE_STYLE st,
 void PushOB(OrderBlockRec &arr[], OrderBlockRec &ob) {
     int n = ArraySize(arr);
     ArrayResize(arr, n + 1);
+    // shift right (unshift)
     for(int i = n; i > 0; i--) arr[i] = arr[i - 1];
     arr[0] = ob;
     if(ArraySize(arr) > 100) ArrayResize(arr, 100);
@@ -829,6 +764,9 @@ void StoreOrderBlock(Pivot &p, bool internalChannel, int bias) {
     if(!internalChannel && !InpShowSwingOBs) return;
     if(internalChannel  && !InpShowInternalOBs) return;
 
+    // Find OB candle between pivot bar and current closed bar.
+    // pivotOff is expressed in logical offsets relative to the CURRENT scan position,
+    // so it needs g_scanShift subtracted out (during live mode g_scanShift==0).
     int pivotShiftMQL = iBarShift(_Symbol, _Period, p.barTime, false);
     if(pivotShiftMQL <= 0) return;
     int pivotOff = pivotShiftMQL - 1 - g_scanShift;
@@ -863,6 +801,7 @@ void StoreOrderBlock(Pivot &p, bool internalChannel, int bias) {
 void RemoveOBAt(OrderBlockRec &arr[], int idx) {
     int n = ArraySize(arr);
     if(idx < 0 || idx >= n) return;
+    // delete drawn object
     SafeDelete(OBJ_PREFIX + "ob_" + IntegerToString(arr[idx].objId));
     for(int i = idx; i < n - 1; i++) arr[i] = arr[i + 1];
     ArrayResize(arr, n - 1);
@@ -918,12 +857,17 @@ void DrawOrderBlocks(bool internalChannel) {
             if(internalChannel) fill = (ob.bias == BEARISH) ? InpInternalBearOBColor : InpInternalBullOBColor;
             else                fill = (ob.bias == BEARISH) ? InpSwingBearOBColor    : InpSwingBullOBColor;
         }
-        color border = fill;   // v1.11 fix
+        // v1.11 fix: OBJ_RECTANGLE has no separate border/fill channels in MT5, so
+        // passing CLR_NONE here used to make internal OBs invisible. Always use the
+        // fill color — internal OBs now render with a 1-pixel outline of the same hue,
+        // which is essentially indistinguishable from a borderless fill at chart zoom.
+        color border = fill;
 
         string name = OBJ_PREFIX + "ob_" + IntegerToString(ob.objId);
         DrawRect(name, ob.obTime, ob.obHigh, rightEdge, ob.obLow, border, fill, true);
     }
 }
+
 
 //===================== DISPLAY STRUCTURE (BOS/CHoCH) ================
 void DisplayStructure(bool internalChannel) {
@@ -934,6 +878,7 @@ void DisplayStructure(bool internalChannel) {
         bearishBar = (h - MathMax(c, o)) < (MathMin(c, o) - l);
     }
 
+    // ===== Bullish side: close crosses ABOVE pivotHigh =====
     Pivot ph; TrendBias tb;
     if(internalChannel) { ph = g_internalHigh; tb = g_internalTrend; }
     else                { ph = g_swingHigh;    tb = g_swingTrend;    }
@@ -972,6 +917,7 @@ void DisplayStructure(bool internalChannel) {
             color c = internalChannel ? ResolveInternalBull() : ResolveSwingBull();
             ENUM_LINE_STYLE st = internalChannel ? STYLE_DASH : STYLE_SOLID;
             ENUM_SMC_LABEL_SIZE sz = internalChannel ? InpInternalLabelSize : InpSwingLabelSize;
+            // Pass a fresh local pivot copy by reference
             Pivot phCopy = ph;
             DrawStructure(phCopy, tag, c, st, sz, false, internalChannel, false);
         }
@@ -982,6 +928,7 @@ void DisplayStructure(bool internalChannel) {
         }
     }
 
+    // ===== Bearish side: close crosses BELOW pivotLow =====
     Pivot pl;
     if(internalChannel) { pl = g_internalLow; tb = g_internalTrend; }
     else                { pl = g_swingLow;    tb = g_swingTrend;    }
@@ -1049,9 +996,13 @@ void DeleteFairValueGaps() {
 void DrawFairValueGaps() {
     ENUM_TIMEFRAMES tf = InpFVGTimeframe == PERIOD_CURRENT ? _Period : InpFVGTimeframe;
 
+    // MTF FVG (different TF than chart) is only supported in live mode.
+    // Backfilling it would require mapping chart-TF scan positions to HTF bar
+    // shifts, which adds complexity for a feature most users don't enable.
     bool isChartTF = (tf == _Period);
     if(!isChartTF && g_scanShift > 0) return;
 
+    // For MTF: only evaluate when a new bar formed on that TF (live only)
     if(tf != _Period) {
         datetime cur = iTime(_Symbol, tf, 0);
         static datetime lastFvgTfBar = 0;
@@ -1059,8 +1010,10 @@ void DrawFairValueGaps() {
         lastFvgTfBar = cur;
     }
 
+    // When TF == chart TF, layer g_scanShift onto the lookback so backfill works.
     int extra = isChartTF ? g_scanShift : 0;
 
+    // Pull last 3 bars on the chosen TF (closed)
     double last2H  = iHigh (_Symbol, tf, 3 + extra);
     double last2L  = iLow  (_Symbol, tf, 3 + extra);
     double lastC   = iClose(_Symbol, tf, 2 + extra);
@@ -1119,372 +1072,6 @@ void DrawFairValueGaps() {
         for(int i = n; i > 0; i--) g_fvgs[i] = g_fvgs[i - 1];
         g_fvgs[0] = rec;
     }
-}
-
-//====================================================================
-//  v1.12 — SMART SUPPORT / RESISTANCE + TRENDLINES
-//  Ported from "Smarter SnR" (© hanabil, MPL-2.0)
-//====================================================================
-
-//---------------- source selectors for the trendline module ---------
-double TLHigh(int off) { return (InpTLSource == TL_SHADOW) ? H(off) : C_(off); }
-double TLLow (int off) { return (InpTLSource == TL_SHADOW) ? L(off) : C_(off); }
-
-//---------------- raw pivot tests -----------------------------------
-bool IsPivotHighRaw(int centerOff, int period) {
-    double c = H(centerOff);
-    if(c <= 0) return false;
-    for(int i = 1; i <= period; i++) {
-        if(H(centerOff + i) >= c) return false;
-        if(H(centerOff - i) >= c) return false;
-    }
-    return true;
-}
-
-bool IsPivotLowRaw(int centerOff, int period) {
-    double c = L(centerOff);
-    if(c <= 0) return false;
-    for(int i = 1; i <= period; i++) {
-        if(L(centerOff + i) <= c) return false;
-        if(L(centerOff - i) <= c) return false;
-    }
-    return true;
-}
-
-bool IsPivotHighTL(int centerOff, int period) {
-    double c = TLHigh(centerOff);
-    if(c <= 0) return false;
-    for(int i = 1; i <= period; i++) {
-        if(TLHigh(centerOff + i) >= c) return false;
-        if(TLHigh(centerOff - i) >= c) return false;
-    }
-    return true;
-}
-
-bool IsPivotLowTL(int centerOff, int period) {
-    double c = TLLow(centerOff);
-    if(c <= 0) return false;
-    for(int i = 1; i <= period; i++) {
-        if(TLLow(centerOff + i) <= c) return false;
-        if(TLLow(centerOff - i) <= c) return false;
-    }
-    return true;
-}
-
-//---------------- level + zigzag storage ----------------------------
-void PushSnR(SnRLevel &arr[], double price, datetime t) {
-    int n = ArraySize(arr);
-    if(n < SNR_MAX_LEVELS) { ArrayResize(arr, n + 1); n++; }
-    for(int i = n - 1; i > 0; i--) arr[i] = arr[i - 1];
-    arr[0].price = NormalizeDouble(price, _Digits);
-    arr[0].time  = t;
-}
-
-void PushZigZag(double price, datetime t, int type) {
-    if(!InpShowZigZag) return;
-    if(g_zzSegments >= ZZ_MAX_SEGMENTS) return;
-
-    int n = ArraySize(g_zz);
-    ArrayResize(g_zz, n + 1);
-    g_zz[n].price = price;
-    g_zz[n].time  = t;
-    g_zz[n].type  = type;
-
-    if(n >= 1) {
-        g_zzSegments++;
-        string nm = OBJ_PREFIX + "zz_" + IntegerToString(g_zzSegments);
-        DrawTrend(nm, g_zz[n - 1].time, g_zz[n - 1].price, t, price,
-                  InpZigZagColor, STYLE_SOLID, 1, false);
-    }
-}
-
-//---------------- S/R engine ----------------------------------------
-int FindExtremeBetween(int newerOff, int olderOff, bool wantHigh, double &outVal) {
-    if(olderOff - 1 < newerOff + 1) return -1;   // nothing strictly between
-
-    int bestOff = -1;
-    double best = wantHigh ? -DBL_MAX : DBL_MAX;
-
-    for(int off = olderOff - 1; off >= newerOff + 1; off--) {
-        double v = wantHigh ? H(off) : L(off);
-        if(v <= 0) continue;
-        if(wantHigh) { if(v > best) { best = v; bestOff = off; } }
-        else         { if(v < best) { best = v; bestOff = off; } }
-    }
-    if(bestOff < 0) return -1;
-    outVal = best;
-    return bestOff;
-}
-
-void UpdateSnRPivots() {
-    int P = MathMax(1, InpSnRPeriod);
-
-    bool isPH = IsPivotHighRaw(P, P);
-    bool isPL = IsPivotLowRaw (P, P);
-
-    if(isPH == isPL) return;
-
-    if(isPH) {
-        if(g_lastRawType == +1 && g_lastRawTime > 0) {
-            int prevOff = OffsetOfTime(g_lastRawTime);
-            if(prevOff > P) {
-                double lo = 0.0;
-                int loOff = FindExtremeBetween(P, prevOff, false, lo);
-                if(loOff >= 0) {
-                    PushSnR(g_sup, lo, T(loOff));
-                    PushZigZag(lo, T(loOff), -1);
-                }
-            }
-        }
-        PushSnR(g_res, H(P), T(P));
-        PushZigZag(H(P), T(P), +1);
-        g_lastRawType = +1;
-        g_lastRawTime = T(P);
-    }
-    else {
-        if(g_lastRawType == -1 && g_lastRawTime > 0) {
-            int prevOff = OffsetOfTime(g_lastRawTime);
-            if(prevOff > P) {
-                double hi = 0.0;
-                int hiOff = FindExtremeBetween(P, prevOff, true, hi);
-                if(hiOff >= 0) {
-                    PushSnR(g_res, hi, T(hiOff));
-                    PushZigZag(hi, T(hiOff), +1);
-                }
-            }
-        }
-        PushSnR(g_sup, L(P), T(P));
-        PushZigZag(L(P), T(P), -1);
-        g_lastRawType = -1;
-        g_lastRawTime = T(P);
-    }
-}
-
-void DetectSnRCrosses() {
-    double c0 = C_(0), c1 = C_(1);
-
-    if(ArraySize(g_res) > 0) {
-        double r1 = g_res[0].price;
-        if(c1 <= r1 && c0 > r1) g_alerts.snrBreakUp = true;
-    }
-    if(ArraySize(g_sup) > 0) {
-        double s1 = g_sup[0].price;
-        if(c1 >= s1 && c0 < s1) g_alerts.snrBreakDown = true;
-    }
-}
-
-//---------------- trendline engine ----------------------------------
-double TLValueAt(TLine &tl, datetime t) {
-    if(!tl.valid) return 0.0;
-    return tl.p2 + (double)((long)t - (long)tl.t2) * tl.slope;
-}
-
-void DrawTLBreakMarker(bool up) {
-    if(!InpTLBreakMarkers) return;
-
-    string nm;
-    if(InpTLNewestBreakOnly) {
-        nm = OBJ_PREFIX + (up ? "tlBrkUp" : "tlBrkDn");
-    } else {
-        g_tlBreakCounter++;
-        nm = OBJ_PREFIX + (up ? "tlBrkUp_" : "tlBrkDn_") + IntegerToString(g_tlBreakCounter);
-    }
-
-    if(up) DrawArrow(nm, T(0), L(0), 233, ResolveResist(),  ANCHOR_TOP);
-    else   DrawArrow(nm, T(0), H(0), 234, ResolveSupport(), ANCHOR_BOTTOM);
-}
-
-void UpdateTrendlines() {
-    int P = MathMax(1, InpTLPeriod);
-
-    double prevUpVal = g_prevUpVal;  bool hadUpPrev = g_hadUpPrev;
-    double prevLoVal = g_prevLoVal;  bool hadLoPrev = g_hadLoPrev;
-
-    if(IsPivotHighTL(P, P)) {
-        g_tlPhVal1  = g_tlPhVal;   g_tlPhTime1 = g_tlPhTime;
-        g_tlPhVal   = TLHigh(P);   g_tlPhTime  = T(P);
-
-        if(g_tlPhTime1 > 0 && g_tlPhVal < g_tlPhVal1) {
-            g_upperTL.valid = true;
-            g_upperTL.t1 = g_tlPhTime1;  g_upperTL.p1 = g_tlPhVal1;
-            g_upperTL.t2 = g_tlPhTime;   g_upperTL.p2 = g_tlPhVal;
-            double dt = (double)((long)g_upperTL.t2 - (long)g_upperTL.t1);
-            g_upperTL.slope = (dt != 0.0) ? (g_upperTL.p2 - g_upperTL.p1) / dt : 0.0;
-        }
-    }
-
-    if(IsPivotLowTL(P, P)) {
-        g_tlPlVal1  = g_tlPlVal;   g_tlPlTime1 = g_tlPlTime;
-        g_tlPlVal   = TLLow(P);    g_tlPlTime  = T(P);
-
-        if(g_tlPlTime1 > 0 && g_tlPlVal > g_tlPlVal1) {
-            g_lowerTL.valid = true;
-            g_lowerTL.t1 = g_tlPlTime1;  g_lowerTL.p1 = g_tlPlVal1;
-            g_lowerTL.t2 = g_tlPlTime;   g_lowerTL.p2 = g_tlPlVal;
-            double dt = (double)((long)g_lowerTL.t2 - (long)g_lowerTL.t1);
-            g_lowerTL.slope = (dt != 0.0) ? (g_lowerTL.p2 - g_lowerTL.p1) / dt : 0.0;
-        }
-    }
-
-    if(g_upperTL.valid && hadUpPrev) {
-        double nowVal = TLValueAt(g_upperTL, T(0));
-        if(TLHigh(1) < prevUpVal && TLHigh(0) > nowVal) {
-            g_alerts.tlBreakUp = true;
-            DrawTLBreakMarker(true);
-        }
-    }
-    if(g_lowerTL.valid && hadLoPrev) {
-        double nowVal = TLValueAt(g_lowerTL, T(0));
-        if(TLLow(1) > prevLoVal && TLLow(0) < nowVal) {
-            g_alerts.tlBreakDown = true;
-            DrawTLBreakMarker(false);
-        }
-    }
-
-    g_prevUpVal = g_upperTL.valid ? TLValueAt(g_upperTL, T(0)) : 0.0;
-    g_hadUpPrev = g_upperTL.valid;
-    g_prevLoVal = g_lowerTL.valid ? TLValueAt(g_lowerTL, T(0)) : 0.0;
-    g_hadLoPrev = g_lowerTL.valid;
-}
-
-void UpdateSmartSnR() {
-    if(InpShowSnR || InpUseSnRProximityFilter || InpSignalSource == SIG_SNR_BREAK
-       || InpSLMode == SL_SNR_LEVEL) {
-        UpdateSnRPivots();
-        DetectSnRCrosses();
-    }
-    if(InpShowTrendlines || InpUseTLBiasFilter || InpSignalSource == SIG_TRENDLINE_BREAK) {
-        UpdateTrendlines();
-    }
-}
-
-//---------------- drawing -------------------------------------------
-void DrawSnRLevels() {
-    if(!InpShowSnR) return;
-
-    int cnt = MathMax(1, MathMin(SNR_MAX_LEVELS, InpSnRLevelCount));
-    datetime rightT = iTime(_Symbol, _Period, 0) + PeriodSeconds(_Period) * 10;
-    ENUM_LINE_STYLE st = LineStyle(InpSnRLineStyle);
-    int w = MathMax(1, InpSnRLineWidth);
-
-    for(int i = 0; i < SNR_MAX_LEVELS; i++) {
-        string rl = OBJ_PREFIX + "snrR_"  + IntegerToString(i + 1);
-        string rt = OBJ_PREFIX + "snrRT_" + IntegerToString(i + 1);
-        string sl = OBJ_PREFIX + "snrS_"  + IntegerToString(i + 1);
-        string sTx= OBJ_PREFIX + "snrST_" + IntegerToString(i + 1);
-
-        if(i < cnt && i < ArraySize(g_res)) {
-            DrawTrend(rl, g_res[i].time, g_res[i].price, rightT, g_res[i].price,
-                      ResolveResist(), st, w, InpSnRExtendRight);
-            if(InpSnRShowPrice)
-                DrawText(rt, rightT, g_res[i].price,
-                         "R" + IntegerToString(i + 1) + " -> " + DoubleToString(g_res[i].price, _Digits),
-                         ResolveResist(), 8, ANCHOR_LEFT);
-            else SafeDelete(rt);
-        } else { SafeDelete(rl); SafeDelete(rt); }
-
-        if(i < cnt && i < ArraySize(g_sup)) {
-            DrawTrend(sl, g_sup[i].time, g_sup[i].price, rightT, g_sup[i].price,
-                      ResolveSupport(), st, w, InpSnRExtendRight);
-            if(InpSnRShowPrice)
-                DrawText(sTx, rightT, g_sup[i].price,
-                         "S" + IntegerToString(i + 1) + " -> " + DoubleToString(g_sup[i].price, _Digits),
-                         ResolveSupport(), 8, ANCHOR_LEFT);
-            else SafeDelete(sTx);
-        } else { SafeDelete(sl); SafeDelete(sTx); }
-    }
-}
-
-void DrawTrendlinesOnChart() {
-    if(!InpShowTrendlines) {
-        SafeDelete(OBJ_PREFIX + "tlUp");   SafeDelete(OBJ_PREFIX + "tlUpTxt");
-        SafeDelete(OBJ_PREFIX + "tlLo");   SafeDelete(OBJ_PREFIX + "tlLoTxt");
-        return;
-    }
-
-    datetime nowT   = iTime(_Symbol, _Period, 0);
-    datetime rightT = InpTLExtendToNow ? nowT : nowT;
-    datetime labelT = nowT + PeriodSeconds(_Period) * 10;
-    ENUM_LINE_STYLE st = LineStyle(InpTLStyle);
-    int w = MathMax(1, InpTLWidth);
-
-    if(g_upperTL.valid) {
-        double proj = TLValueAt(g_upperTL, rightT);
-        DrawTrend(OBJ_PREFIX + "tlUp", g_upperTL.t1, g_upperTL.p1, rightT, proj,
-                  InpTLColor, st, w, false);
-        if(InpTLShowPrice)
-            DrawText(OBJ_PREFIX + "tlUpTxt", labelT, TLValueAt(g_upperTL, labelT),
-                     "Upper -> " + DoubleToString(TLValueAt(g_upperTL, nowT), _Digits),
-                     ResolveResist(), 8, ANCHOR_LEFT);
-        else SafeDelete(OBJ_PREFIX + "tlUpTxt");
-    }
-
-    if(g_lowerTL.valid) {
-        double proj = TLValueAt(g_lowerTL, rightT);
-        DrawTrend(OBJ_PREFIX + "tlLo", g_lowerTL.t1, g_lowerTL.p1, rightT, proj,
-                  InpTLColor, st, w, false);
-        if(InpTLShowPrice)
-            DrawText(OBJ_PREFIX + "tlLoTxt", labelT, TLValueAt(g_lowerTL, labelT),
-                     "Lower -> " + DoubleToString(TLValueAt(g_lowerTL, nowT), _Digits),
-                     ResolveSupport(), 8, ANCHOR_LEFT);
-        else SafeDelete(OBJ_PREFIX + "tlLoTxt");
-    }
-}
-
-//---------------- dashboard -----------------------------------------
-void DashLine(int idx, string txt, color c) {
-    string nm = OBJ_PREFIX + "dash_" + IntegerToString(idx);
-    if(ObjectFind(0, nm) < 0) ObjectCreate(0, nm, OBJ_LABEL, 0, 0, 0);
-    ObjectSetInteger(0, nm, OBJPROP_CORNER,     CORNER_LEFT_UPPER);
-    ObjectSetInteger(0, nm, OBJPROP_XDISTANCE,  10);
-    ObjectSetInteger(0, nm, OBJPROP_YDISTANCE,  18 + idx * 14);
-    ObjectSetString (0, nm, OBJPROP_TEXT,       txt);
-    ObjectSetString (0, nm, OBJPROP_FONT,       "Consolas");
-    ObjectSetInteger(0, nm, OBJPROP_FONTSIZE,   8);
-    ObjectSetInteger(0, nm, OBJPROP_COLOR,      c);
-    ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
-    ObjectSetInteger(0, nm, OBJPROP_HIDDEN,     true);
-}
-
-void DrawSnRDashboard() {
-    if(!InpShowDashboard) {
-        for(int i = 0; i < DASH_MAX_LINES; i++) SafeDelete(OBJ_PREFIX + "dash_" + IntegerToString(i));
-        return;
-    }
-
-    int row = 0;
-    color hdr = clrSilver;
-
-    string biasTxt = (g_swingTrend.bias == BULLISH) ? "BULL"
-                   : (g_swingTrend.bias == BEARISH) ? "BEAR" : "FLAT";
-    DashLine(row++, "SMC  " + _Symbol + "  " + EnumToString((ENUM_TIMEFRAMES)_Period)
-                    + "   swing bias: " + biasTxt, hdr);
-
-    if(InpShowSnR) {
-        int cnt = MathMax(1, MathMin(SNR_MAX_LEVELS, InpSnRLevelCount));
-        for(int i = 0; i < cnt && row < DASH_MAX_LINES - 3; i++) {
-            string s = (i < ArraySize(g_sup)) ? DoubleToString(g_sup[i].price, _Digits) : "-";
-            string r = (i < ArraySize(g_res)) ? DoubleToString(g_res[i].price, _Digits) : "-";
-            DashLine(row++, "S" + IntegerToString(i + 1) + " " + s
-                          + "   R" + IntegerToString(i + 1) + " " + r, hdr);
-        }
-    }
-
-    if(InpShowTrendlines && row < DASH_MAX_LINES - 1) {
-        datetime nowT = iTime(_Symbol, _Period, 0);
-        string up = g_upperTL.valid ? DoubleToString(TLValueAt(g_upperTL, nowT), _Digits) : "-";
-        string lo = g_lowerTL.valid ? DoubleToString(TLValueAt(g_lowerTL, nowT), _Digits) : "-";
-        DashLine(row++, "TL upper " + up, ResolveResist());
-        DashLine(row++, "TL lower " + lo, ResolveSupport());
-    }
-
-    for(int i = row; i < DASH_MAX_LINES; i++) SafeDelete(OBJ_PREFIX + "dash_" + IntegerToString(i));
-}
-
-void DrawSmartSnRAll() {
-    DrawSnRLevels();
-    DrawTrendlinesOnChart();
-    DrawSnRDashboard();
 }
 
 //===================== MTF LEVELS ===================================
@@ -1604,11 +1191,6 @@ void DispatchAlerts() {
     if(g_alerts.equalLows)             lines += "Equal Lows detected\n";
     if(g_alerts.bullishFVG)            lines += "Bullish FVG formed\n";
     if(g_alerts.bearishFVG)            lines += "Bearish FVG formed\n";
-    // v1.12
-    if(InpAlertOnTLBreak && g_alerts.tlBreakUp)     lines += "Upper Trendline Broken\n";
-    if(InpAlertOnTLBreak && g_alerts.tlBreakDown)   lines += "Lower Trendline Broken\n";
-    if(InpAlertOnSnRCross && g_alerts.snrBreakUp)   lines += "Close crossed above R1\n";
-    if(InpAlertOnSnRCross && g_alerts.snrBreakDown) lines += "Close crossed below S1\n";
 
     if(StringLen(lines) == 0) return;
     string header = "SMC " + _Symbol + " " + EnumToString(_Period);
@@ -1693,80 +1275,6 @@ bool PassesTrendFilter(int dir, bool internalChannel) {
     else        return bias == BEARISH;
 }
 
-bool PassesSnRProximity(int dir) {
-    if(!InpUseSnRProximityFilter) return true;
-    double atr = GetATR14(0);
-    if(atr <= 0) return true;
-
-    double px   = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
-    double band = atr * InpSnRProximityATR;
-    int    cnt  = MathMax(1, MathMin(SNR_MAX_LEVELS, InpSnRLevelCount));
-
-    if(dir > 0) {
-        for(int i = 0; i < cnt && i < ArraySize(g_res); i++)
-            if(g_res[i].price > px && (g_res[i].price - px) < band) {
-                PrintFormat("[SMC] Long blocked — R%d at %s is %.1f pts overhead",
-                            i + 1, DoubleToString(g_res[i].price, _Digits),
-                            (g_res[i].price - px) / SymbolInfoDouble(_Symbol, SYMBOL_POINT));
-                return false;
-            }
-    } else {
-        for(int i = 0; i < cnt && i < ArraySize(g_sup); i++)
-            if(g_sup[i].price < px && (px - g_sup[i].price) < band) {
-                PrintFormat("[SMC] Short blocked — S%d at %s is %.1f pts below",
-                            i + 1, DoubleToString(g_sup[i].price, _Digits),
-                            (px - g_sup[i].price) / SymbolInfoDouble(_Symbol, SYMBOL_POINT));
-                return false;
-            }
-    }
-    return true;
-}
-
-bool PassesTLBias(int dir) {
-    if(!InpUseTLBiasFilter) return true;
-    double c = C_(0);
-    datetime t = T(0);
-    if(dir > 0 && g_upperTL.valid && c < TLValueAt(g_upperTL, t)) return false;
-    if(dir < 0 && g_lowerTL.valid && c > TLValueAt(g_lowerTL, t)) return false;
-    return true;
-}
-
-//===================== INVALIDATION LEVELS (gate; auto-track v1.20/1.21) ===
-// A BUY is invalid once price trades down to/through the active buy floor;
-// a SELL once price trades up to/through the active sell ceiling. The GATE
-// levels live in g_invalBuy / g_invalSell and are set by UpdateInvalLevels()
-// from the context TF (InpInvalCtxTF). Per-TF levels are stored on each MTF
-// engine and drawn separately. Applied to the main logic (TryEnter) only —
-// independent of the FBC module. A level of 0 means "off".
-double g_invalBuy  = 0.0;   // active (gate) buy-invalidation floor   (0 = none)
-double g_invalSell = 0.0;   // active (gate) sell-invalidation ceiling (0 = none)
-string g_invalSrc  = "";    // short label of the gate source (for logs)
-
-bool BuyInvalidated() {
-    if(!InpInvalEnable || g_invalBuy <= 0.0) return false;
-    return SymbolInfoDouble(_Symbol, SYMBOL_BID) <= g_invalBuy;
-}
-bool SellInvalidated() {
-    if(!InpInvalEnable || g_invalSell <= 0.0) return false;
-    return SymbolInfoDouble(_Symbol, SYMBOL_ASK) >= g_invalSell;
-}
-bool PassesInvalidation(int dir) {
-    if(!InpInvalEnable || !InpInvalBlockTrades) return true;
-    if(dir > 0 && BuyInvalidated()) {
-        PrintFormat("[SMC] BUY blocked — price %s at/below buy-invalidation %s (%s)",
-                    DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_BID), _Digits),
-                    DoubleToString(g_invalBuy, _Digits), g_invalSrc);
-        return false;
-    }
-    if(dir < 0 && SellInvalidated()) {
-        PrintFormat("[SMC] SELL blocked — price %s at/above sell-invalidation %s (%s)",
-                    DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_ASK), _Digits),
-                    DoubleToString(g_invalSell, _Digits), g_invalSrc);
-        return false;
-    }
-    return true;
-}
-
 double ComputeSL(int dir) {
     double price = (dir > 0) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                              : SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -1777,30 +1285,14 @@ double ComputeSL(int dir) {
     if(InpSLMode == SL_ATR) {
         sl = (dir > 0) ? price - atrBuf * InpSLATRMultiplier
                        : price + atrBuf * InpSLATRMultiplier;
-    }
-    else if(InpSLMode == SL_LAST_PIVOT) {
+    } else if(InpSLMode == SL_LAST_PIVOT) {
         sl = (dir > 0) ? g_swingLow.currentLevel  - atrBuf * InpSLBufferATR
                        : g_swingHigh.currentLevel + atrBuf * InpSLBufferATR;
         if((dir > 0 && g_swingLow.currentLevel == 0.0) || (dir < 0 && g_swingHigh.currentLevel == 0.0)) {
             sl = (dir > 0) ? price - atrBuf * InpSLATRMultiplier
                            : price + atrBuf * InpSLATRMultiplier;
         }
-    }
-    else if(InpSLMode == SL_SNR_LEVEL) {
-        double lvl = 0.0;
-        if(dir > 0) {
-            for(int i = 0; i < ArraySize(g_sup); i++)
-                if(g_sup[i].price < price) { lvl = g_sup[i].price; break; }
-            sl = (lvl > 0) ? lvl - atrBuf * InpSLBufferATR
-                           : price - atrBuf * InpSLATRMultiplier;
-        } else {
-            for(int i = 0; i < ArraySize(g_res); i++)
-                if(g_res[i].price > price) { lvl = g_res[i].price; break; }
-            sl = (lvl > 0) ? lvl + atrBuf * InpSLBufferATR
-                           : price + atrBuf * InpSLATRMultiplier;
-        }
-    }
-    else { // SL_TRAILING_EXTREME
+    } else { // SL_TRAILING_EXTREME
         sl = (dir > 0) ? g_trailing.bottom - atrBuf * InpSLBufferATR
                        : g_trailing.top    + atrBuf * InpSLBufferATR;
         if((dir > 0 && g_trailing.bottom == DBL_MAX) || (dir < 0 && g_trailing.top == -DBL_MAX)) {
@@ -1827,9 +1319,6 @@ void TryEnter(int dir, bool internalChannel) {
     if(!CheckSpread())   return;
     if(!PassesTrendFilter(dir, internalChannel)) return;
     if(!PassesPDZoneFilter(dir)) return;
-    if(!PassesSnRProximity(dir)) return;   // v1.12
-    if(!PassesTLBias(dir))       return;   // v1.12
-    if(!PassesInvalidation(dir)) return;   // v1.19
 
     if(!InpAllowMultiplePos && CountOpenPositions() > 0) return;
     if(HasOpenPositionInDir(dir)) return;
@@ -1871,8 +1360,6 @@ bool SignalFires(int dir) {
         case SIG_SWING_CHOCH:    return bull ? g_alerts.swingBullishCHoCH    : g_alerts.swingBearishCHoCH;
         case SIG_SWING_ANY:      return bull ? (g_alerts.swingBullishBOS || g_alerts.swingBullishCHoCH)
                                              : (g_alerts.swingBearishBOS || g_alerts.swingBearishCHoCH);
-        case SIG_TRENDLINE_BREAK:return bull ? g_alerts.tlBreakUp           : g_alerts.tlBreakDown;
-        case SIG_SNR_BREAK:      return bull ? g_alerts.snrBreakUp          : g_alerts.snrBreakDown;
         default:                 return false;
     }
 }
@@ -1919,717 +1406,695 @@ void ManageOpenPositions() {
     }
 }
 
-//+------------------------------------------------------------------+
-//|  v1.16 — FAILED CHoCH MODULE (SELL + BUY) — ALL-TIMEFRAME SCAN   |
-//|  v1.17 — every completed pattern on a tradable TF opens a trade; |
-//|          notifications split into [SETUP] and [TRIGGERED].       |
-//|                                                                  |
-//|  SELL: failed BULLISH CHoCH          BUY: failed BEARISH CHoCH   |
-//|                                                                  |
-//|  Per timeframe, one structure engine feeds two mirror patterns:  |
-//|   SELL 1. bearish break -> store high that launched it (ref HH)  |
-//|        2. bullish CHoCH closing BELOW ref HH -> ARMED            |
-//|        3. rally retraces >= MinRetrace, never closes above ref   |
-//|        4. bearish break (or loss of CHoCH level) -> SELL         |
-//|   BUY  1. bullish break -> store low that launched it (ref LL)   |
-//|        2. bearish CHoCH closing ABOVE ref LL -> ARMED            |
-//|        3. drop retraces >= MinRetrace, never closes below ref    |
-//|        4. bullish break (or reclaim of CHoCH level) -> BUY       |
-//|                                                                  |
-//|  v1.17 ENTRY RULE: any completed pattern on a TF at or above     |
-//|  InpFBC_MinTradeTF opens a trade. InpFBC_EntryMode no longer     |
-//|  gates the entry (kept only so existing presets still load).     |
-//|  InpFBC_BlockOpposing and the one-entry-per-tick cap still apply.|
-//+------------------------------------------------------------------+
-enum ENUM_FBC_TRIGGER {
-    FBC_TRIG_STRUCTURE,     // Structure break against the CHoCH (close beyond last pivot)
-    FBC_TRIG_CHOCH_LEVEL,   // Close back through the broken CHoCH level
-    FBC_TRIG_EITHER         // Whichever happens first
-};
-enum ENUM_FBC_ENTRY {
-    FBC_ENTRY_ANY_TF,            // (v1.17: no longer used for entry gating)
-    FBC_ENTRY_CONFLUENCE,        // (v1.17: no longer used for entry gating)
-    FBC_ENTRY_CONFLUENCE_CHOCH   // (v1.17: no longer used for entry gating)
-};
-enum ENUM_FBC_TP {
-    FBC_TP_ORIGIN,   // Target the extreme the failed CHoCH launched from
-    FBC_TP_RR        // Fixed reward:risk
-};
+//===================== MTF STRONG/WEAK DASHBOARD (v1.12) ============
+//
+// Concept (matches DrawHighLowSwings on the chart TF, extended to MTF):
+//   * In a BULLISH structure the swing LOW is the STRONG low (should hold) and
+//     the swing HIGH above is the WEAK high (the liquidity target).
+//   * In a BEARISH structure the swing HIGH is the STRONG high (should hold) and
+//     the swing LOW below is the WEAK low (the target).
+// Strategy encoded: if price touches the STRONG level and the candle CLOSES back
+//   without breaking it, that is a reaction/hold — the expected destination is the
+//   opposite WEAK level of the SAME timeframe (the "target", shown in gold).
+//
+// Per timeframe we run a compact fractal-pivot + HH/HL/LH/LL bias read over the
+// last InpMTFScanBars bars. This is a self-contained recompute (not incremental)
+// run on each chart new bar + on the timer, so it stays correct across restarts.
 
-#define FBC_IDLE        0
-#define FBC_ARMED       1
-#define FBC_TRIGGERED   2
-#define FBC_MAX_TF      8
-#define FBC_PANEL_ROWS  (FBC_MAX_TF + 3)
-#define FBC_SELL       -1
-#define FBC_BUY         1
-
-input group "═══ FAILED CHoCH — SELL + BUY, ALL-TF SCAN (v1.16) ═══"
-input bool             InpFBC_Enable         = true;
-input bool             InpFBC_EnableSell     = true;    // Scan/trade failed BULLISH CHoCH -> SELL
-input bool             InpFBC_EnableBuy      = true;    // Scan/trade failed BEARISH CHoCH -> BUY
-input bool             InpFBC_ScanM1         = false;   // Scan M1
-input bool             InpFBC_ScanM5         = true;    // Scan M5
-input bool             InpFBC_ScanM15        = true;    // Scan M15
-input bool             InpFBC_ScanM30        = true;    // Scan M30
-input bool             InpFBC_ScanH1         = true;    // Scan H1
-input bool             InpFBC_ScanH4         = true;    // Scan H4
-input bool             InpFBC_ScanD1         = true;    // Scan D1
-input bool             InpFBC_ScanW1         = false;   // Scan W1
-input int              InpFBC_PivotLenLow    = 3;       // Pivot length M1–M30
-input int              InpFBC_PivotLenHigh   = 5;       // Pivot length H1 and above
-input ENUM_FBC_ENTRY   InpFBC_EntryMode      = FBC_ENTRY_CONFLUENCE; // (v1.17: kept for preset compatibility; does not gate entry)
-input int              InpFBC_MinConfluence  = 1;       // (v1.17: shown in panel/SETUP text only)
-input bool             InpFBC_BlockOpposing  = true;    // Skip a trade if a higher TF has an OPPOSITE setup active
-input ENUM_TIMEFRAMES  InpFBC_MinTradeTF     = PERIOD_M5; // Lowest TF allowed to open a trade
-input ENUM_FBC_TRIGGER InpFBC_Trigger        = FBC_TRIG_STRUCTURE;
-input double           InpFBC_MinRetrace     = 0.5;     // Pullback must reach this fraction of the leg (0.5 = premium/discount)
-input bool             InpFBC_AllowWickSweep = true;    // Wick through the ref extreme OK if the close holds
-input int              InpFBC_MaxArmedBars   = 60;      // Setup expires after N bars (of its own TF)
-input int              InpFBC_SetupValidBars = 6;       // A triggered TF counts as higher-TF setup for N of its bars
-input bool             InpFBC_AlertEveryTF   = true;    // Push a [SETUP] alert when a pattern completes on ANY scanned TF
-input bool             InpFBC_AlertOnArm     = false;   // Alert when a setup arms
-input bool             InpFBC_Trade          = true;    // Auto-trade FBC signals (independent of InpEnableTrading)
-input ENUM_FBC_TP      InpFBC_TPMode         = FBC_TP_ORIGIN;
-input double           InpFBC_RR             = 2.0;     // R:R for FBC_TP_RR (and fallback)
-input double           InpFBC_MinRR          = 1.5;     // Skip if the origin target pays less than this
-input double           InpFBC_SLBufferATR    = 0.3;     // SL buffer beyond the LH / HL (x ATR14 of that TF)
-input bool             InpFBC_UseEAFilters   = false;   // Also require PD-zone / S/R proximity / TL-bias filters
-input bool             InpFBC_Draw           = true;
-input bool             InpFBC_DrawLowerTFs   = false;   // Also draw patterns from TFs below the chart TF
-input bool             InpFBC_ShowPanel      = true;
-input int              InpFBC_BackfillBars   = 1500;    // Per-TF history replay on load
-input string           InpFBC_Comment        = "SMC-FBC";
-
-//============================ STATE =================================
-struct FBCPattern {
-    int      state;
-    double   ref;      datetime refT;
-    double   origin;   datetime originT;
-    double   chochLvl; datetime chochLvlT;
-    datetime chochT;
-    double   fail;     datetime failT;
-    int      armedBars;
-    int      trigBars;
-    bool     now;       // completed on the last processed bar
-};
-
-struct FBCEngine {
-    ENUM_TIMEFRAMES tf;
-    int      pivLen;
-    int      atrHandle;
-    datetime lastBar;
-    bool     ready;
-    // structure
-    double   ph;  datetime phT;  bool phX;
-    double   pl;  datetime plT;  bool plX;
-    int      bias;
-    double   bearRef; datetime bearRefT;   // high that launched the latest bearish break
-    double   bullRef; datetime bullRefT;   // low that launched the latest bullish break
-    // patterns
-    FBCPattern sell;
-    FBCPattern buy;
-    // per-bar flags
-    bool     bearChochNow;
-    bool     bullChochNow;
-};
-
-FBCEngine g_fbc[FBC_MAX_TF];     // sorted HIGHEST timeframe first
-string    g_fbcTag[FBC_MAX_TF];
-int       g_fbcCount  = 0;
-bool      g_fbcActive = false;
-long      g_fbcId     = 0;
-
-//============================ HELPERS ===============================
-bool FBC_IsPivotHigh(FBCEngine &e, int s) {
-    int N = e.pivLen, c = s + N;
-    double v = iHigh(_Symbol, e.tf, c);
-    if(v <= 0) return false;
-    for(int i = 1; i <= N; i++) {
-        if(iHigh(_Symbol, e.tf, c + i) >= v) return false;   // older side strict
-        if(iHigh(_Symbol, e.tf, c - i) >  v) return false;   // newer side allows equal
-    }
-    return true;
+string TFName(ENUM_TIMEFRAMES tf) {
+    string s = EnumToString(tf);          // e.g. "PERIOD_H4"
+    if(StringFind(s, "PERIOD_") == 0) s = StringSubstr(s, 7);
+    return s;
 }
 
-bool FBC_IsPivotLow(FBCEngine &e, int s) {
-    int N = e.pivLen, c = s + N;
-    double v = iLow(_Symbol, e.tf, c);
-    if(v <= 0) return false;
-    for(int i = 1; i <= N; i++) {
-        if(iLow(_Symbol, e.tf, c + i) <= v) return false;
-        if(iLow(_Symbol, e.tf, c - i) <  v) return false;
-    }
-    return true;
-}
+// Analyse one timeframe → fill swing/strong/weak/bias fields of m.
+// Does NOT touch m.state / m.lastReactBar (reaction state persists across refreshes).
+void AnalyzeTF(MTFLevel &m) {
+    ENUM_TIMEFRAMES tf = m.tf;
+    int L    = InpMTFSwingLength;
+    int avail = Bars(_Symbol, tf);
+    int scan = MathMin(InpMTFScanBars, avail);
 
-double FBC_Retrace(FBCPattern &p, int dir) {
-    double leg = (dir == FBC_SELL) ? (p.ref - p.origin) : (p.origin - p.ref);
-    if(leg <= 0) return 0.0;
-    return (dir == FBC_SELL) ? (p.fail - p.origin) / leg : (p.origin - p.fail) / leg;
-}
+    m.valid  = false;
+    m.inPlay = false;
+    if(scan < 2 * L + 10) return;
 
-double FBC_ATR(FBCEngine &e) {
-    double b[];
-    if(e.atrHandle == INVALID_HANDLE) return 0.0;
-    if(CopyBuffer(e.atrHandle, 0, 1, 1, b) < 1) return 0.0;
-    return b[0];
-}
+    double   hArr[];  datetime htArr[];  int nh = 0;
+    double   lArr[];  datetime ltArr[];  int nl = 0;
 
-void FBC_Notify(string msg) {
-    Print("[SMC-FBC] ", msg);
-    if(InpAlertsOn)     Alert("SMC-FBC " + _Symbol + ": " + msg);
-    if(InpPushNotifyOn) SendNotification("SMC-FBC " + _Symbol + ": " + msg);
-}
-
-string FBC_Px(double p)    { return DoubleToString(p, _Digits); }
-string FBC_Side(int dir)   { return (dir == FBC_SELL) ? "SELL" : "BUY"; }
-bool   FBC_SideOn(int dir) { return (dir == FBC_SELL) ? InpFBC_EnableSell : InpFBC_EnableBuy; }
-
-bool FBC_ShouldDraw(FBCEngine &e) {
-    if(!InpFBC_Draw) return false;
-    return InpFBC_DrawLowerTFs || PeriodSeconds(e.tf) >= PeriodSeconds(_Period);
-}
-
-bool FBC_InSetup(FBCPattern &p, int dir) {
-    double px = (dir == FBC_SELL) ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
-                                  : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-    if(p.state == FBC_ARMED) {
-        bool holding = (dir == FBC_SELL) ? (px < p.ref) : (px > p.ref);
-        return holding && FBC_Retrace(p, dir) >= InpFBC_MinRetrace;
-    }
-    if(p.state == FBC_TRIGGERED) {
-        bool holding = (dir == FBC_SELL) ? (px < p.fail) : (px > p.fail);
-        return holding && p.trigBars <= InpFBC_SetupValidBars;
-    }
-    return false;
-}
-
-bool FBC_EngineInSetup(int j, int dir) {
-    if(!FBC_SideOn(dir)) return false;
-    return (dir == FBC_SELL) ? FBC_InSetup(g_fbc[j].sell, dir) : FBC_InSetup(g_fbc[j].buy, dir);
-}
-
-int FBC_HigherSetups(int i, int dir, int &nearestIdx, string &list) {
-    int n = 0;
-    nearestIdx = -1;
-    list = "";
-    for(int j = 0; j < i; j++) {   // array is sorted high → low, so j < i is higher
-        if(PeriodSeconds(g_fbc[j].tf) <= PeriodSeconds(g_fbc[i].tf)) continue;
-        if(!FBC_EngineInSetup(j, dir)) continue;
-        n++;
-        nearestIdx = j;
-        list += (StringLen(list) > 0 ? "+" : "") + g_fbcTag[j];
-    }
-    return n;
-}
-
-//============================ DRAWING ===============================
-void FBC_DrawCompleted(FBCEngine &e, FBCPattern &p, int dir, string tag, datetime trigT,
-                       double trigHigh, double trigLow) {
-    if(!FBC_ShouldDraw(e)) return;
-    g_fbcId++;
-    string b    = OBJ_PREFIX + "fbc_" + tag + (dir == FBC_SELL ? "_S_" : "_B_") + IntegerToString(g_fbcId) + "_";
-    color  bear = ResolveSwingBear();
-    color  bull = ResolveSwingBull();
-    color  main = (dir == FBC_SELL) ? bear : bull;   // colour of the trade direction
-    color  ctr  = (dir == FBC_SELL) ? bull : bear;   // colour of the failed CHoCH
-    double off  = FBC_ATR(e) * 0.6;
-
-    DrawTrend(b + "ref",  p.refT, p.ref, trigT, p.ref, main, STYLE_DOT, 1, false);
-    DrawText (b + "refT", p.refT, p.ref, tag + (dir == FBC_SELL ? " ref HH" : " ref LL"), main, 7,
-              dir == FBC_SELL ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER);
-
-    DrawTrend(b + "ch",   p.chochLvlT, p.chochLvl, p.chochT, p.chochLvl, ctr, STYLE_DASH, 1, false);
-    datetime mid = (datetime)((long)p.chochLvlT / 2 + (long)p.chochT / 2);
-    DrawText (b + "chT",  mid, p.chochLvl, tag + " failed CHoCH", ctr, 7,
-              dir == FBC_SELL ? ANCHOR_LOWER : ANCHOR_UPPER);
-
-    DrawText (b + "fx",   p.failT, p.fail, tag + (dir == FBC_SELL ? " LH" : " HL"), main, 8,
-              dir == FBC_SELL ? ANCHOR_LOWER : ANCHOR_UPPER);
-
-    DrawTrend(b + "tp",   p.originT, p.origin, trigT, p.origin, ctr, STYLE_DOT, 1, false);
-
-    if(dir == FBC_SELL) {
-        DrawArrow(b + "arr",  trigT, trigHigh, 234, main, ANCHOR_BOTTOM);
-        DrawText (b + "arrT", trigT, trigHigh + off, "FBC SELL " + tag, main, 7, ANCHOR_LOWER);
-    } else {
-        DrawArrow(b + "arr",  trigT, trigLow, 233, main, ANCHOR_TOP);
-        DrawText (b + "arrT", trigT, trigLow - off, "FBC BUY " + tag, main, 7, ANCHOR_UPPER);
-    }
-}
-
-void FBC_DrawLiveSide(FBCEngine &e, FBCPattern &p, int dir, string tag) {
-    string b = OBJ_PREFIX + "fbcLive_" + tag + (dir == FBC_SELL ? "_S_" : "_B_");
-    if(!FBC_ShouldDraw(e) || !FBC_SideOn(dir) || p.state != FBC_ARMED) {
-        SafeDelete(b + "ref"); SafeDelete(b + "refT");
-        SafeDelete(b + "ch");  SafeDelete(b + "chT");
-        return;
-    }
-    color main = (dir == FBC_SELL) ? ResolveSwingBear() : ResolveSwingBull();
-    color ctr  = (dir == FBC_SELL) ? ResolveSwingBull() : ResolveSwingBear();
-    datetime rt = iTime(_Symbol, _Period, 0) + PeriodSeconds(_Period) * 10;
-    DrawTrend(b + "ref",  p.refT, p.ref, rt, p.ref, main, STYLE_DOT, 1, false);
-    DrawText (b + "refT", rt, p.ref,
-              tag + (dir == FBC_SELL ? " FBC sell armed — must hold below " : " FBC buy armed — must hold above ")
-              + FBC_Px(p.ref), main, 7, ANCHOR_LEFT);
-    DrawTrend(b + "ch",   p.chochLvlT, p.chochLvl, rt, p.chochLvl, ctr, STYLE_DASH, 1, false);
-    DrawText (b + "chT",  rt, p.chochLvl, tag + " CHoCH level", ctr, 7, ANCHOR_LEFT);
-}
-
-void FBC_PanelLine(int row, string txt, color c) {
-    string nm = OBJ_PREFIX + "fbcPanel_" + IntegerToString(row);
-    if(ObjectFind(0, nm) < 0) ObjectCreate(0, nm, OBJ_LABEL, 0, 0, 0);
-    ObjectSetInteger(0, nm, OBJPROP_CORNER,     CORNER_RIGHT_UPPER);
-    ObjectSetInteger(0, nm, OBJPROP_ANCHOR,     ANCHOR_RIGHT_UPPER);
-    ObjectSetInteger(0, nm, OBJPROP_XDISTANCE,  10);
-    ObjectSetInteger(0, nm, OBJPROP_YDISTANCE,  18 + row * 14);
-    ObjectSetString (0, nm, OBJPROP_TEXT,       txt);
-    ObjectSetString (0, nm, OBJPROP_FONT,       "Consolas");
-    ObjectSetInteger(0, nm, OBJPROP_FONTSIZE,   8);
-    ObjectSetInteger(0, nm, OBJPROP_COLOR,      c);
-    ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
-    ObjectSetInteger(0, nm, OBJPROP_HIDDEN,     true);
-}
-
-string FBC_SideText(FBCPattern &p, int dir) {
-    if(!FBC_SideOn(dir)) return "off";
-    if(p.state == FBC_ARMED)
-        return StringFormat("ARMED ref %s ret %.0f%%", FBC_Px(p.ref), FBC_Retrace(p, dir) * 100.0);
-    if(p.state == FBC_TRIGGERED)
-        return StringFormat("TRIG %db %s %s", p.trigBars, (dir == FBC_SELL ? "LH" : "HL"), FBC_Px(p.fail));
-    return "-";
-}
-
-string FBC_ModeText() {
-    // v1.17 — entry is "every completed pattern on a tradable TF".
-    return "every completed pattern (>= " + StringSubstr(EnumToString(InpFBC_MinTradeTF), 7) + ")";
-}
-
-void FBC_DrawPanel() {
-    if(!g_fbcActive) return;
-    for(int i = 0; i < g_fbcCount; i++) {
-        FBC_DrawLiveSide(g_fbc[i], g_fbc[i].sell, FBC_SELL, g_fbcTag[i]);
-        FBC_DrawLiveSide(g_fbc[i], g_fbc[i].buy,  FBC_BUY,  g_fbcTag[i]);
-    }
-
-    if(!InpFBC_ShowPanel) {
-        for(int r = 0; r < FBC_PANEL_ROWS; r++) SafeDelete(OBJ_PREFIX + "fbcPanel_" + IntegerToString(r));
-        return;
-    }
-
-    FBC_PanelLine(0, "Failed-CHoCH scan | " + FBC_ModeText()
-                     + (InpFBC_Trade ? " | AUTO-TRADE ON" : " | alerts only"), clrSilver);
-
-    string sellAct = "", buyAct = "";
-    for(int i = 0; i < g_fbcCount; i++) {
-        bool sAct = FBC_EngineInSetup(i, FBC_SELL);
-        bool bAct = FBC_EngineInSetup(i, FBC_BUY);
-        if(sAct) sellAct += (StringLen(sellAct) > 0 ? " " : "") + g_fbcTag[i];
-        if(bAct) buyAct  += (StringLen(buyAct)  > 0 ? " " : "") + g_fbcTag[i];
-
-        bool sBusy = g_fbc[i].sell.state != FBC_IDLE && InpFBC_EnableSell;
-        bool bBusy = g_fbc[i].buy.state  != FBC_IDLE && InpFBC_EnableBuy;
-        color c = (sBusy && bBusy) ? clrOrange
-                : sBusy ? ResolveSwingBear()
-                : bBusy ? ResolveSwingBull() : clrSilver;
-
-        string tagPad = g_fbcTag[i];
-        while(StringLen(tagPad) < 3) tagPad += " ";
-        string bias = (g_fbc[i].bias == BULLISH) ? "bull" : (g_fbc[i].bias == BEARISH) ? "bear" : "flat";
-        FBC_PanelLine(i + 1, tagPad + " " + bias + " | S: " + FBC_SideText(g_fbc[i].sell, FBC_SELL)
-                               + " | B: " + FBC_SideText(g_fbc[i].buy, FBC_BUY), c);
-    }
-    FBC_PanelLine(g_fbcCount + 1, "Sell setups: " + (StringLen(sellAct) > 0 ? sellAct : "none"),
-                  StringLen(sellAct) > 0 ? ResolveSwingBear() : clrSilver);
-    FBC_PanelLine(g_fbcCount + 2, "Buy setups:  " + (StringLen(buyAct) > 0 ? buyAct : "none"),
-                  StringLen(buyAct) > 0 ? ResolveSwingBull() : clrSilver);
-
-    for(int r = g_fbcCount + 3; r < FBC_PANEL_ROWS; r++) SafeDelete(OBJ_PREFIX + "fbcPanel_" + IntegerToString(r));
-}
-
-//============================ ENGINE ================================
-void FBC_RunState(FBCPattern &p, int dir, double h, double l, double c, datetime t,
-                  string tag, bool live) {
-    if(p.state == FBC_ARMED) {
-        p.armedBars++;
-        if(dir == FBC_SELL) { if(h > p.fail) { p.fail = h; p.failT = t; } }
-        else                { if(l < p.fail) { p.fail = l; p.failT = t; } }
-
-        bool lost;
-        if(dir == FBC_SELL) lost = InpFBC_AllowWickSweep ? (c > p.ref) : (h > p.ref);
-        else                lost = InpFBC_AllowWickSweep ? (c < p.ref) : (l < p.ref);
-
-        if(lost) {
-            p.state = FBC_IDLE;   // ref extreme taken back: genuine reversal, not a failed CHoCH
-            if(live) PrintFormat("[SMC-FBC] %s %s setup cancelled — %s taken", tag, FBC_Side(dir), FBC_Px(p.ref));
+    // Walk old → new. A fractal pivot at shift s needs L bars on each side.
+    for(int s = scan - 1 - L; s >= 1 + L; s--) {
+        int hiIdx = iHighest(_Symbol, tf, MODE_HIGH, 2 * L + 1, s - L);
+        if(hiIdx == s) {
+            ArrayResize(hArr, nh + 1); ArrayResize(htArr, nh + 1);
+            hArr[nh]  = iHigh(_Symbol, tf, s);
+            htArr[nh] = iTime(_Symbol, tf, s);
+            nh++;
         }
-        else if(p.armedBars > InpFBC_MaxArmedBars) {
-            p.state = FBC_IDLE;
-            if(live) PrintFormat("[SMC-FBC] %s %s setup expired", tag, FBC_Side(dir));
+        int loIdx = iLowest(_Symbol, tf, MODE_LOW, 2 * L + 1, s - L);
+        if(loIdx == s) {
+            ArrayResize(lArr, nl + 1); ArrayResize(ltArr, nl + 1);
+            lArr[nl]  = iLow(_Symbol, tf, s);
+            ltArr[nl] = iTime(_Symbol, tf, s);
+            nl++;
         }
     }
-    else if(p.state == FBC_TRIGGERED) {
-        p.trigBars++;
-        bool dead = (dir == FBC_SELL) ? (c > p.fail) : (c < p.fail);
-        if(dead) p.state = FBC_IDLE;
+    if(nh < 2 || nl < 2) return;
+
+    double curH = hArr[nh - 1], prevH = hArr[nh - 2];
+    double curL = lArr[nl - 1], prevL = lArr[nl - 2];
+
+    // Bias from market structure (HH+HL = bull, LH+LL = bear; otherwise lean on
+    // whichever side made the most recent decisive pivot).
+    int bias;
+    if(curH > prevH && curL > prevL)      bias = BULLISH;
+    else if(curH < prevH && curL < prevL) bias = BEARISH;
+    else if(htArr[nh - 1] > ltArr[nl - 1]) bias = (curH > prevH) ? BULLISH : BEARISH;
+    else                                   bias = (curL < prevL) ? BEARISH : BULLISH;
+
+    m.swingHigh = curH;
+    m.swingLow  = curL;
+    m.bias      = bias;
+    m.eqMid     = (curH + curL) / 2.0;
+
+    if(bias == BULLISH) {
+        m.strongLow  = curL;   m.weakHigh = curH;   // active pair
+        m.strongHigh = prevH;  m.weakLow  = prevL;  // last opposite-leg refs
+        m.strongActive = m.strongLow;  m.targetWeak = m.weakHigh;
+    } else { // BEARISH
+        m.strongHigh = curH;   m.weakLow  = curL;   // active pair
+        m.strongLow  = prevL;  m.weakHigh = prevH;  // last opposite-leg refs
+        m.strongActive = m.strongHigh; m.targetWeak = m.weakLow;
+    }
+
+    double px   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double band = (curH - curL) * 0.05;
+    if(px > m.eqMid + band)      m.pricePD = +1;   // premium
+    else if(px < m.eqMid - band) m.pricePD = -1;   // discount
+    else                          m.pricePD = 0;   // equilibrium
+
+    // v1.13: "in play" = price is still inside this TF's active strong↔weak band
+    // (i.e. the current swing range) — the frame price is actually trading within.
+    double ipLo = MathMin(m.strongActive, m.targetWeak);
+    double ipHi = MathMax(m.strongActive, m.targetWeak);
+    m.inPlay = (px >= ipLo && px <= ipHi);
+
+    m.valid = true;
+}
+
+void FireMTFAlert(MTFLevel &m, bool isHold, bool isBreak) {
+    if(!InpAlertsOn && !InpPushNotifyOn) return;
+
+    string msg = "";
+    if(isHold) {
+        if(m.bias == BULLISH)
+            msg = StringFormat("%s %s: Strong Low %s HELD (bullish rejection) -> target Weak High %s",
+                               _Symbol, m.tag,
+                               DoubleToString(m.strongLow, _Digits),
+                               DoubleToString(m.weakHigh, _Digits));
+        else
+            msg = StringFormat("%s %s: Strong High %s HELD (bearish rejection) -> target Weak Low %s",
+                               _Symbol, m.tag,
+                               DoubleToString(m.strongHigh, _Digits),
+                               DoubleToString(m.weakLow, _Digits));
+    } else if(isBreak) {
+        if(m.state == MTF_BROKEN_LOW)
+            msg = StringFormat("%s %s: Strong Low %s BROKEN (bias shifting down)",
+                               _Symbol, m.tag, DoubleToString(m.strongLow, _Digits));
+        else
+            msg = StringFormat("%s %s: Strong High %s BROKEN (bias shifting up)",
+                               _Symbol, m.tag, DoubleToString(m.strongHigh, _Digits));
+    }
+    if(StringLen(msg) == 0) return;
+
+    if(InpAlertsOn)     Alert("SMC MTF | " + msg);
+    if(InpPushNotifyOn) SendNotification("SMC MTF " + msg);
+}
+
+// Evaluate the just-closed CHART bar against the active strong level of this TF.
+// Rule: wick into [level ± buffer] AND close stays on the right side = HOLD (fires once).
+// A close through the level = BROKEN (invalidation).
+void EvaluateReaction(MTFLevel &m) {
+    if(!m.valid) { m.state = MTF_NONE; return; }
+
+    double buff = InpReactBufferATR * GetATR14(0);
+    if(buff <= 0) buff = (H(0) - L(0));
+
+    double   bh = iHigh (_Symbol, _Period, 1);
+    double   bl = iLow  (_Symbol, _Period, 1);
+    double   bc = iClose(_Symbol, _Period, 1);
+    datetime bt = iTime (_Symbol, _Period, 1);
+
+    if(m.bias == BULLISH && m.strongLow > 0) {
+        if(bc < m.strongLow) {                              // closed below → broken
+            if(m.state != MTF_BROKEN_LOW) {
+                m.state = MTF_BROKEN_LOW;
+                if(InpMTFBreakAlerts) FireMTFAlert(m, false, true);
+            }
+        } else {
+            bool touched = (bl <= m.strongLow + buff);      // wick reached the zone
+            if(touched && bc > m.strongLow) {               // and closed back above
+                if(m.lastReactBar != bt) {
+                    m.lastReactBar = bt;
+                    m.state = MTF_HOLD_BULL;
+                    if(InpMTFReactAlerts) FireMTFAlert(m, true, false);
+                } else {
+                    m.state = MTF_HOLD_BULL;
+                }
+            }
+        }
+    }
+    else if(m.bias == BEARISH && m.strongHigh > 0) {
+        if(bc > m.strongHigh) {                             // closed above → broken
+            if(m.state != MTF_BROKEN_HIGH) {
+                m.state = MTF_BROKEN_HIGH;
+                if(InpMTFBreakAlerts) FireMTFAlert(m, false, true);
+            }
+        } else {
+            bool touched = (bh >= m.strongHigh - buff);     // wick reached the zone
+            if(touched && bc < m.strongHigh) {              // and closed back below
+                if(m.lastReactBar != bt) {
+                    m.lastReactBar = bt;
+                    m.state = MTF_HOLD_BEAR;
+                    if(InpMTFReactAlerts) FireMTFAlert(m, true, false);
+                } else {
+                    m.state = MTF_HOLD_BEAR;
+                }
+            }
+        }
+    }
+    else {
+        m.state = MTF_NONE;
     }
 }
 
-void FBC_Arm(FBCEngine &e, FBCPattern &p, int dir, int s, double h, double l, datetime t,
-             string tag, bool live) {
-    double   ref  = (dir == FBC_SELL) ? e.bearRef  : e.bullRef;
-    datetime refT = (dir == FBC_SELL) ? e.bearRefT : e.bullRefT;
-
-    int sRef = iBarShift(_Symbol, e.tf, refT, false);
-    if(sRef < s) sRef = s;
-    int cnt = sRef - s + 1;
-    int idx = (dir == FBC_SELL) ? iLowest (_Symbol, e.tf, MODE_LOW,  cnt, s)
-                                : iHighest(_Symbol, e.tf, MODE_HIGH, cnt, s);
-
-    p.state     = FBC_ARMED;
-    p.armedBars = 0;
-    p.ref       = ref;
-    p.refT      = refT;
-    if(dir == FBC_SELL) {
-        p.origin  = (idx >= 0) ? iLow(_Symbol, e.tf, idx) : l;
-        p.chochLvl = e.ph;  p.chochLvlT = e.phT;
-        p.fail    = h;
-    } else {
-        p.origin  = (idx >= 0) ? iHigh(_Symbol, e.tf, idx) : h;
-        p.chochLvl = e.pl;  p.chochLvlT = e.plT;
-        p.fail    = l;
-    }
-    p.originT = (idx >= 0) ? iTime(_Symbol, e.tf, idx) : t;
-    p.chochT  = t;
-    p.failT   = t;
-
-    if(live && InpFBC_AlertOnArm)
-        FBC_Notify(StringFormat("[SETUP] %s %s CHoCH %s ref %s — watching for failure (%s setup)",
-                                tag, dir == FBC_SELL ? "bullish" : "bearish",
-                                dir == FBC_SELL ? "below" : "above", FBC_Px(p.ref), FBC_Side(dir)));
+//----- Panel object helpers -----
+void PanelBG(string name, int x, int y, int w, int h, color bg) {
+    if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name, OBJPROP_CORNER,      InpPanelCorner);
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE,   x);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE,   y);
+    ObjectSetInteger(0, name, OBJPROP_XSIZE,       w);
+    ObjectSetInteger(0, name, OBJPROP_YSIZE,       h);
+    ObjectSetInteger(0, name, OBJPROP_BGCOLOR,     bg);
+    ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+    ObjectSetInteger(0, name, OBJPROP_COLOR,       C'60,62,70');
+    ObjectSetInteger(0, name, OBJPROP_BACK,        false);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
+    ObjectSetInteger(0, name, OBJPROP_HIDDEN,      true);
 }
 
-void FBC_CheckTrigger(FBCEngine &e, FBCPattern &p, int dir, bool structBreak, double c, double cPrev,
-                      datetime t, double h, double l, string tag) {
-    if(p.state != FBC_ARMED || p.chochT >= t) return;
+void PanelLabel(string name, int x, int y, string txt, color c, int fs) {
+    if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name, OBJPROP_CORNER,     InpPanelCorner);
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE,  x);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE,  y);
+    ObjectSetString (0, name, OBJPROP_TEXT,       txt);
+    ObjectSetString (0, name, OBJPROP_FONT,       "Consolas");
+    ObjectSetInteger(0, name, OBJPROP_FONTSIZE,   fs);
+    ObjectSetInteger(0, name, OBJPROP_COLOR,      c);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+}
 
-    bool lvlBreak = (dir == FBC_SELL) ? (c < p.chochLvl && cPrev >= p.chochLvl)
-                                      : (c > p.chochLvl && cPrev <= p.chochLvl);
-    bool trig = (InpFBC_Trigger == FBC_TRIG_STRUCTURE)   ? structBreak
-              : (InpFBC_Trigger == FBC_TRIG_CHOCH_LEVEL) ? lvlBreak
-              : (structBreak || lvlBreak);
-    if(!trig) return;
+void DeletePanel() {
+    DeleteByPrefix(OBJ_PREFIX + "pnl_");
+}
 
-    if(FBC_Retrace(p, dir) >= InpFBC_MinRetrace) {
-        p.state    = FBC_TRIGGERED;
-        p.trigBars = 0;
-        p.now      = true;
-        FBC_DrawCompleted(e, p, dir, tag, t, h, l);
+void RefreshMTFPanel() {
+    if(!InpShowMTFPanel) { DeletePanel(); return; }
+
+    int x0 = InpPanelX, y0 = InpPanelY;
+    int fs = InpPanelFontSize;
+    int rowH = fs + 8;
+
+    // column x-offsets (from panel origin)
+    int cTF = 0, cBias = 52, cSH = 110, cWH = 188, cSL = 266, cWL = 344, cRe = 422;
+    int panelW = cRe + 120;
+    int panelH = rowH * (MTF_COUNT + 3) + 10;
+
+    PanelBG(OBJ_PREFIX + "pnl_bg", x0 - 6, y0 - 6, panelW, panelH, InpPanelBgColor);
+
+    double px = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    PanelLabel(OBJ_PREFIX + "pnl_title", x0, y0,
+               "MTF STRONG/WEAK  " + _Symbol + "  " + DoubleToString(px, _Digits),
+               clrWhite, fs);
+
+    int hy = y0 + rowH;
+    PanelLabel(OBJ_PREFIX + "pnl_h_tf",   x0 + cTF,   hy, "TF",     InpPanelTextColor, fs);
+    PanelLabel(OBJ_PREFIX + "pnl_h_bias", x0 + cBias, hy, "Bias",   InpPanelTextColor, fs);
+    PanelLabel(OBJ_PREFIX + "pnl_h_sh",   x0 + cSH,   hy, "S.High", InpPanelTextColor, fs);
+    PanelLabel(OBJ_PREFIX + "pnl_h_wh",   x0 + cWH,   hy, "W.High", InpPanelTextColor, fs);
+    PanelLabel(OBJ_PREFIX + "pnl_h_sl",   x0 + cSL,   hy, "S.Low",  InpPanelTextColor, fs);
+    PanelLabel(OBJ_PREFIX + "pnl_h_wl",   x0 + cWL,   hy, "W.Low",  InpPanelTextColor, fs);
+    PanelLabel(OBJ_PREFIX + "pnl_h_re",   x0 + cRe,   hy, "React",  InpPanelTextColor, fs);
+
+    for(int i = 0; i < MTF_COUNT; i++) {
+        MTFLevel m = g_mtf[i];
+        int ry = y0 + rowH * (i + 2);
+        string id = IntegerToString(i);
+
+        // v1.13: highlight the row when price is trading inside this TF's strong↔weak band.
+        // Drawn BEFORE this row's labels so the text stays on top of the highlight.
+        string hlName    = OBJ_PREFIX + "pnl_hl_" + id;
+        bool   rowInPlay = (InpMTFHighlightInPlay && m.valid && m.inPlay);
+        if(rowInPlay) PanelBG(hlName, x0 - 4, ry - 3, panelW - 4, rowH, InpMTFInPlayColor);
+        else          SafeDelete(hlName);
+
+        color  tfC   = rowInPlay ? InpMTFInPlayTagColor : clrWhite;
+        string tfTxt = (rowInPlay ? "> " : "") + m.tag;
+        PanelLabel(OBJ_PREFIX + "pnl_tf_" + id, x0 + cTF, ry, tfTxt, tfC, fs);
+
+        if(!m.valid) {
+            PanelLabel(OBJ_PREFIX + "pnl_bias_" + id, x0 + cBias, ry, "n/a", InpPanelDimColor, fs);
+            PanelLabel(OBJ_PREFIX + "pnl_sh_"   + id, x0 + cSH,   ry, "-",   InpPanelDimColor, fs);
+            PanelLabel(OBJ_PREFIX + "pnl_wh_"   + id, x0 + cWH,   ry, "-",   InpPanelDimColor, fs);
+            PanelLabel(OBJ_PREFIX + "pnl_sl_"   + id, x0 + cSL,   ry, "-",   InpPanelDimColor, fs);
+            PanelLabel(OBJ_PREFIX + "pnl_wl_"   + id, x0 + cWL,   ry, "-",   InpPanelDimColor, fs);
+            PanelLabel(OBJ_PREFIX + "pnl_re_"   + id, x0 + cRe,   ry, "-",   InpPanelDimColor, fs);
+            continue;
+        }
+
+        color  biasC = m.bias == BULLISH ? InpPanelBullColor
+                     : m.bias == BEARISH ? InpPanelBearColor : InpPanelDimColor;
+        string biasT = m.bias == BULLISH ? "BULL" : m.bias == BEARISH ? "BEAR" : "RNG";
+        string pdT   = m.pricePD > 0 ? " P" : m.pricePD < 0 ? " D" : " E";
+        PanelLabel(OBJ_PREFIX + "pnl_bias_" + id, x0 + cBias, ry, biasT + pdT, biasC, fs);
+
+        // which cells are the ACTIVE pair for current bias (bright); target weak = gold
+        bool shActive = (m.bias == BEARISH);
+        bool whActive = (m.bias == BULLISH);
+        bool slActive = (m.bias == BULLISH);
+        bool wlActive = (m.bias == BEARISH);
+
+        PanelLabel(OBJ_PREFIX + "pnl_sh_" + id, x0 + cSH, ry, DoubleToString(m.strongHigh, _Digits),
+                   shActive ? InpPanelBearColor : InpPanelDimColor, fs);
+        PanelLabel(OBJ_PREFIX + "pnl_wh_" + id, x0 + cWH, ry, DoubleToString(m.weakHigh, _Digits),
+                   whActive ? clrGold : InpPanelDimColor, fs);
+        PanelLabel(OBJ_PREFIX + "pnl_sl_" + id, x0 + cSL, ry, DoubleToString(m.strongLow, _Digits),
+                   slActive ? InpPanelBullColor : InpPanelDimColor, fs);
+        PanelLabel(OBJ_PREFIX + "pnl_wl_" + id, x0 + cWL, ry, DoubleToString(m.weakLow, _Digits),
+                   wlActive ? clrGold : InpPanelDimColor, fs);
+
+        string reT; color reC;
+        switch(m.state) {
+            case MTF_HOLD_BULL:   reT = "HOLD UP"; reC = InpPanelBullColor; break;
+            case MTF_HOLD_BEAR:   reT = "HOLD DN"; reC = InpPanelBearColor; break;
+            case MTF_BROKEN_HIGH: reT = "BRK HI";  reC = clrOrange;         break;
+            case MTF_BROKEN_LOW:  reT = "BRK LO";  reC = clrOrange;         break;
+            default:              reT = "-";       reC = InpPanelDimColor;  break;
+        }
+        PanelLabel(OBJ_PREFIX + "pnl_re_" + id, x0 + cRe, ry, reT, reC, fs);
     }
-    else if(structBreak) {
-        p.state = FBC_IDLE;   // turned before reaching premium/discount: plain continuation
+
+    int fy = y0 + rowH * (MTF_COUNT + 2);
+    PanelLabel(OBJ_PREFIX + "pnl_foot", x0 + cTF, fy,
+               "bright=active | gold=target | reject strong -> take opposite weak",
+               InpPanelDimColor, MathMax(6, fs - 1));
+}
+
+// Recompute every timeframe, optionally evaluate the closed chart bar for reactions,
+// then redraw the panel.
+void UpdateMTF(bool evaluateReactions) {
+    for(int i = 0; i < MTF_COUNT; i++) {
+        AnalyzeTF(g_mtf[i]);
+        if(evaluateReactions) EvaluateReaction(g_mtf[i]);
+    }
+    RefreshMTFPanel();
+}
+
+//===================== LIQUIDITY SEQUENCE TRACKER (v1.13) ===========
+//
+// Pattern being tracked (bullish shown; bearish is the exact mirror):
+//
+//   1) BREAK        A CHoCH/BOS confirms up (a bar CLOSES above a prior pivot high).
+//                   The leg that broke it originated from a demand ORDER BLOCK below,
+//                   and it left the last minor swing LOW untested — that low is the
+//                   INDUCEMENT (the "left-behind" liquidity you marked in black).
+//   2) RETRACE      Price trades back down from the break toward the OB.
+//   3) (sweep)      On the way it usually runs the inducement low (grabs liquidity).
+//   4) MITIGATED    Price taps the OB zone (wick into [obBottom .. obTop] ± tolerance).
+//   5) CONTINUATION "Original move begins": after the tap, a bar closes back in the
+//                   break direction beyond the OB  →  trigger fires.
+//   INVALID         A close clean through the OB voids the sequence.
+//
+// This is recomputed statelessly per (TF × channel) each chart bar, so it is
+// restart-safe and always reflects the MOST RECENT break on that TF/channel.
+// "Internal" vs "swing/external" is just a different pivot length per the inputs.
+// No trading is wired here — it drives the panel, chart objects and alerts only.
+
+string LiqObjBase(LiqSequence &s) {
+    return OBJ_PREFIX + "liq_" + s.tag + "_" + (s.internalCh ? "INT" : "EXT") + "_";
+}
+
+void DeleteLiqObjects(LiqSequence &s) {
+    DeleteByPrefix(LiqObjBase(s));
+}
+
+string LiqPhaseText(ENUM_SEQ_STATE st) {
+    switch(st) {
+        case SEQ_BREAK:        return "BREAK";
+        case SEQ_RETRACE:      return "RETRACE";
+        case SEQ_MITIGATED:    return "AT OB";
+        case SEQ_CONTINUATION: return "GO";
+        case SEQ_INVALID:      return "VOID";
+        default:               return "-";
     }
 }
 
-void FBC_ProcessBar(FBCEngine &e, string tag, int s, bool live) {
-    e.sell.now     = false;
-    e.buy.now      = false;
-    e.bearChochNow = false;
-    e.bullChochNow = false;
+void LiqAlert(LiqSequence &s, string ev) {
+    if(!InpAlertsOn && !InpPushNotifyOn) return;
 
-    double   h     = iHigh (_Symbol, e.tf, s);
-    double   l     = iLow  (_Symbol, e.tf, s);
-    double   c     = iClose(_Symbol, e.tf, s);
-    double   cPrev = iClose(_Symbol, e.tf, s + 1);
-    datetime t     = iTime (_Symbol, e.tf, s);
-    if(h <= 0 || t == 0) return;
+    string dir  = (s.dir == BULLISH) ? "Bull" : "Bear";
+    string ch   = s.internalCh ? "INT" : "EXT";
+    string kind = s.isChoCH ? "CHoCH" : "BOS";
+    string msg;
 
-    //--- 1. pivots confirmed on this bar
-    if(FBC_IsPivotHigh(e, s)) {
-        e.ph  = iHigh(_Symbol, e.tf, s + e.pivLen);
-        e.phT = iTime(_Symbol, e.tf, s + e.pivLen);
-        e.phX = false;
-    }
-    if(FBC_IsPivotLow(e, s)) {
-        e.pl  = iLow (_Symbol, e.tf, s + e.pivLen);
-        e.plT = iTime(_Symbol, e.tf, s + e.pivLen);
-        e.plX = false;
-    }
+    if(ev == "BREAK")
+        msg = StringFormat("%s %s %s %s %s | inducement %s, OB %s-%s",
+              _Symbol, s.tag, ch, dir, kind,
+              DoubleToString(s.induceLevel, _Digits),
+              DoubleToString(s.obBottom, _Digits), DoubleToString(s.obTop, _Digits));
+    else if(ev == "MITIGATE")
+        msg = StringFormat("%s %s %s %s: price tapped OB %s-%s (inducement %s)",
+              _Symbol, s.tag, ch, dir,
+              DoubleToString(s.obBottom, _Digits), DoubleToString(s.obTop, _Digits),
+              s.induceSwept ? "swept" : "not swept");
+    else // CONTINUE
+        msg = StringFormat("%s %s %s %s: ORIGINAL MOVE resuming from OB (continuation)",
+              _Symbol, s.tag, ch, dir);
 
-    //--- 2. running pattern states
-    FBC_RunState(e.sell, FBC_SELL, h, l, c, t, tag, live);
-    FBC_RunState(e.buy,  FBC_BUY,  h, l, c, t, tag, live);
-
-    //--- 3. bullish break (BOS or CHoCH)
-    bool breakUp = false;
-    if(e.ph > 0 && !e.phX && c > e.ph) {
-        breakUp = true;
-        bool choch = (e.bias == BEARISH);
-        if(choch) e.bullChochNow = true;
-
-        if(choch && e.bearRef > 0 && e.bearRefT < t && c < e.bearRef)
-            FBC_Arm(e, e.sell, FBC_SELL, s, h, l, t, tag, live);
-
-        e.phX  = true;
-        e.bias = BULLISH;
-
-        int sPL = (e.plT > 0) ? iBarShift(_Symbol, e.tf, e.plT, false) : s;
-        if(sPL < s) sPL = s;
-        int idx = iLowest(_Symbol, e.tf, MODE_LOW, sPL - s + 1, s);
-        e.bullRef  = (idx >= 0) ? iLow (_Symbol, e.tf, idx) : l;
-        e.bullRefT = (idx >= 0) ? iTime(_Symbol, e.tf, idx) : t;
-    }
-
-    //--- 4. bearish break (BOS or CHoCH)
-    bool breakDown = false;
-    if(e.pl > 0 && !e.plX && c < e.pl) {
-        breakDown = true;
-        bool choch = (e.bias == BULLISH);
-        if(choch) e.bearChochNow = true;
-
-        if(choch && e.bullRef > 0 && e.bullRefT < t && c > e.bullRef)
-            FBC_Arm(e, e.buy, FBC_BUY, s, h, l, t, tag, live);
-
-        e.plX  = true;
-        e.bias = BEARISH;
-
-        int sPH = (e.phT > 0) ? iBarShift(_Symbol, e.tf, e.phT, false) : s;
-        if(sPH < s) sPH = s;
-        int idx = iHighest(_Symbol, e.tf, MODE_HIGH, sPH - s + 1, s);
-        e.bearRef  = (idx >= 0) ? iHigh(_Symbol, e.tf, idx) : h;
-        e.bearRefT = (idx >= 0) ? iTime(_Symbol, e.tf, idx) : t;
-    }
-
-    //--- 5. triggers
-    FBC_CheckTrigger(e, e.sell, FBC_SELL, breakDown, c, cPrev, t, h, l, tag);
-    FBC_CheckTrigger(e, e.buy,  FBC_BUY,  breakUp,   c, cPrev, t, h, l, tag);
+    if(InpAlertsOn)     Alert("SMC LIQ | " + msg);
+    if(InpPushNotifyOn) SendNotification("SMC LIQ " + msg);
 }
 
-//============================ EXECUTION =============================
-void FBC_Execute(int src, int dir, double slRef, double tpRef) {
-    if(!InpFBC_Trade) return;
-    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) {
-        FBC_Notify("[TRIGGERED] " + FBC_Side(dir) + " NOT opened — enable 'Algo Trading' in the toolbar and 'Allow Algo Trading' in the EA's Common tab");
-        return;
+// Analyse one (TF × channel): find the most recent break, its inducement + OB,
+// then step the state machine over the bars that followed. Alerts fire only when
+// allowAlerts is true AND the triggering bar is new (debounced per event).
+void LiqAnalyzeChannel(ENUM_TIMEFRAMES tf, int pivLen, bool internalCh,
+                       LiqSequence &s, bool allowAlerts) {
+    s.tf         = tf;
+    s.tag        = TFName(tf);
+    s.internalCh = internalCh;
+
+    int avail = Bars(_Symbol, tf);
+    int scan  = MathMin(InpLiqScanBars, avail);
+    if(scan < 2 * pivLen + 20) { s.active = false; s.state = SEQ_IDLE; s.dir = 0; return; }
+
+    // --- replay structure old→new to locate the most recent break ---
+    double   lastHigh = 0, lastLow = 0;
+    datetime lastHighT = 0, lastLowT = 0;
+    bool     haveHigh = false, haveLow = false;
+    int      trend = NEUTRAL;
+
+    bool     foundBreak = false, brChoCH = false;
+    int      brDir = 0, brShift = 0;
+    double   brPivot = 0, brInduce = 0;
+    datetime brTime = 0, brInduceT = 0;
+
+    for(int sft = scan - 1 - pivLen; sft >= 1 + pivLen; sft--) {
+        bool isHi = (iHighest(_Symbol, tf, MODE_HIGH, 2 * pivLen + 1, sft - pivLen) == sft);
+        bool isLo = (iLowest (_Symbol, tf, MODE_LOW,  2 * pivLen + 1, sft - pivLen) == sft);
+        double c = iClose(_Symbol, tf, sft);
+
+        // break check uses pivots confirmed on OLDER bars (registered in prior iterations)
+        if(haveHigh && c > lastHigh) {
+            brDir = BULLISH; brPivot = lastHigh; brTime = iTime(_Symbol, tf, sft); brShift = sft;
+            brChoCH  = (trend == BEARISH);
+            brInduce = haveLow ? lastLow  : 0;  brInduceT = haveLow ? lastLowT : 0;
+            foundBreak = true; trend = BULLISH;
+            haveHigh = false;                   // need a fresh high before the next bull break
+        }
+        else if(haveLow && c < lastLow) {
+            brDir = BEARISH; brPivot = lastLow; brTime = iTime(_Symbol, tf, sft); brShift = sft;
+            brChoCH  = (trend == BULLISH);
+            brInduce = haveHigh ? lastHigh : 0; brInduceT = haveHigh ? lastHighT : 0;
+            foundBreak = true; trend = BEARISH;
+            haveLow = false;
+        }
+
+        // register this bar's fractal(s) AFTER the break check
+        if(isHi) { lastHigh = iHigh(_Symbol, tf, sft); lastHighT = iTime(_Symbol, tf, sft); haveHigh = true; }
+        if(isLo) { lastLow  = iLow (_Symbol, tf, sft); lastLowT  = iTime(_Symbol, tf, sft); haveLow  = true; }
     }
-    if(!CheckSpread()) { Print("[SMC-FBC] ", FBC_Side(dir), " skipped — spread too wide"); return; }
-    if(InpFBC_UseEAFilters &&
-       (!PassesPDZoneFilter(dir) || !PassesSnRProximity(dir) || !PassesTLBias(dir))) {
-        Print("[SMC-FBC] ", FBC_Side(dir), " blocked by EA filters");
-        return;
-    }
-    if(!InpAllowMultiplePos && CountOpenPositions() > 0) { Print("[SMC-FBC] ", FBC_Side(dir), " skipped — a position is already open"); return; }
-    if(HasOpenPositionInDir(dir)) { Print("[SMC-FBC] ", FBC_Side(dir), " skipped — same-direction position already open"); return; }
 
-    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    double minD  = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
-    double buf   = FBC_ATR(g_fbc[src]) * InpFBC_SLBufferATR;
-    double px, sl, tp, risk;
+    if(!foundBreak) { s.active = false; s.state = SEQ_IDLE; s.dir = 0; return; }
 
-    if(dir == FBC_SELL) {
-        px = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-        sl = slRef + buf;
-        if(sl <= px) { Print("[SMC-FBC] Price already above the lower high — SELL skipped"); return; }
-        sl = MathMax(sl, px + minD + point);
-        risk = sl - px;
-        if(InpFBC_TPMode == FBC_TP_ORIGIN && tpRef > 0 && tpRef < px - minD) tp = tpRef;
-        else tp = px - risk * InpFBC_RR;
-    } else {
-        px = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-        sl = slRef - buf;
-        if(sl >= px) { Print("[SMC-FBC] Price already below the higher low — BUY skipped"); return; }
-        sl = MathMin(sl, px - minD - point);
-        risk = px - sl;
-        if(InpFBC_TPMode == FBC_TP_ORIGIN && tpRef > 0 && tpRef > px + minD) tp = tpRef;
-        else tp = px + risk * InpFBC_RR;
+    // --- order block: last opposite-color candle before the breaking leg ---
+    double   obTop = 0, obBot = 0; datetime obT = 0; bool obOK = false;
+    int maxBack = brShift + InpLiqOBLookback;
+    for(int sft = brShift; sft <= maxBack; sft++) {
+        double o  = iOpen (_Symbol, tf, sft);
+        double c2 = iClose(_Symbol, tf, sft);
+        if(brDir == BULLISH && c2 < o) {                 // demand OB = last down candle
+            obTop = iHigh(_Symbol, tf, sft); obBot = iLow(_Symbol, tf, sft);
+            obT = iTime(_Symbol, tf, sft); obOK = true; break;
+        }
+        if(brDir == BEARISH && c2 > o) {                 // supply OB = last up candle
+            obTop = iHigh(_Symbol, tf, sft); obBot = iLow(_Symbol, tf, sft);
+            obT = iTime(_Symbol, tf, sft); obOK = true; break;
+        }
     }
 
-    double rr = MathAbs(tp - px) / risk;
-    if(InpFBC_TPMode == FBC_TP_ORIGIN && rr < InpFBC_MinRR) {
-        PrintFormat("[SMC-FBC] %s skipped — origin target pays %.2fR (min %.2f)", FBC_Side(dir), rr, InpFBC_MinRR);
-        return;
+    // --- step the state machine over bars that followed the break (brShift-1 → 1) ---
+    ENUM_SEQ_STATE st = SEQ_BREAK;
+    bool swept = false, tapped = false, cont = false;
+    datetime contT = 0, mitT = 0;
+    double tol = obOK ? (obTop - obBot) * InpLiqTapTolFrac : 0;
+
+    for(int sft = brShift - 1; sft >= 1; sft--) {
+        double hi = iHigh (_Symbol, tf, sft);
+        double lo = iLow  (_Symbol, tf, sft);
+        double o  = iOpen (_Symbol, tf, sft);
+        double c  = iClose(_Symbol, tf, sft);
+        datetime t = iTime(_Symbol, tf, sft);
+
+        if(brDir == BULLISH) {
+            if(brInduce > 0 && lo < brInduce) swept = true;
+            if(obOK && c < obBot - tol) { st = SEQ_INVALID; break; }      // OB blown
+            if(obOK && !tapped && lo <= obTop + tol) { tapped = true; mitT = t; if(st < SEQ_MITIGATED) st = SEQ_MITIGATED; }
+            if(obOK && tapped) {
+                bool sweepOK = (!InpLiqRequireSweep || swept || brInduce <= 0);
+                if(sweepOK && c > o && c > obTop) { cont = true; contT = t; st = SEQ_CONTINUATION; break; }
+            }
+            if(st == SEQ_BREAK) st = SEQ_RETRACE;
+        }
+        else { // BEARISH
+            if(brInduce > 0 && hi > brInduce) swept = true;
+            if(obOK && c > obTop + tol) { st = SEQ_INVALID; break; }
+            if(obOK && !tapped && hi >= obBot - tol) { tapped = true; mitT = t; if(st < SEQ_MITIGATED) st = SEQ_MITIGATED; }
+            if(obOK && tapped) {
+                bool sweepOK = (!InpLiqRequireSweep || swept || brInduce <= 0);
+                if(sweepOK && c < o && c < obBot) { cont = true; contT = t; st = SEQ_CONTINUATION; break; }
+            }
+            if(st == SEQ_BREAK) st = SEQ_RETRACE;
+        }
     }
 
-    double lot = CalcLotForRisk(risk / point);
-    if(lot <= 0) { Print("[SMC-FBC] Lot=0, refusing trade"); return; }
+    // --- commit to the slot ---
+    s.active      = true;
+    s.dir         = brDir;
+    s.state       = st;
+    s.brokenPivot = brPivot;
+    s.breakTime   = brTime;
+    s.isChoCH     = brChoCH;
+    s.induceLevel = brInduce;
+    s.induceTime  = brInduceT;
+    s.induceSwept = swept;
+    s.obTop       = obTop;
+    s.obBottom    = obBot;
+    s.obTime      = obT;
+    s.obValid     = obOK;
+    s.contBarTime = contT;
 
-    g_trade.SetExpertMagicNumber(InpMagicNumber);
-    g_trade.SetDeviationInPoints(InpSlippagePoints);
-    string cmt = InpFBC_Comment + " " + g_fbcTag[src] + (dir == FBC_SELL ? " S" : " B");
-    sl = NormalizeDouble(sl, _Digits);
-    tp = NormalizeDouble(tp, _Digits);
-
-    bool ok = (dir == FBC_SELL) ? g_trade.Sell(lot, _Symbol, px, sl, tp, cmt)
-                                : g_trade.Buy (lot, _Symbol, px, sl, tp, cmt);
-    if(ok)
-        FBC_Notify(StringFormat("[TRIGGERED] %s %s opened %s lots @ %s | SL %s | TP %s | %.2fR",
-                                FBC_Side(dir), g_fbcTag[src], DoubleToString(lot, 2),
-                                FBC_Px(px), FBC_Px(sl), FBC_Px(tp), rr));
-    else
-        FBC_Notify(StringFormat("[TRIGGERED] %s FAILED: %d %s",
-                                FBC_Side(dir), g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription()));
+    // --- alerts (debounced by event bar time; load/timer passes record without firing) ---
+    if(s.aBreak != brTime) {
+        if(InpLiqAlertBreak && allowAlerts) LiqAlert(s, "BREAK");
+        s.aBreak = brTime;
+    }
+    if(tapped && s.aMit != mitT) {
+        if(InpLiqAlertMitigate && allowAlerts) LiqAlert(s, "MITIGATE");
+        s.aMit = mitT;
+    }
+    if(cont && s.aCont != contT) {
+        if(InpLiqAlertContinue && allowAlerts) LiqAlert(s, "CONTINUE");
+        s.aCont = contT;
+    }
 }
 
-//============================ MTF DECISION ==========================
-// Called once per tick after every engine that closed a bar was processed
-// (highest TF first, so higher-TF context is always up to date).
-// v1.17 — every completed pattern on a tradable TF opens a trade.
-//         Notifications are split: [SETUP] on completion, [TRIGGERED]/
-//         [FAILED] on the entry itself, so the two can't be confused.
-void FBC_Evaluate(bool &fresh[]) {
-    ENUM_TIMEFRAMES minTF = (InpFBC_MinTradeTF == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpFBC_MinTradeTF;
-    bool traded = false;
+// Draw one sequence's visuals: OB top/bottom, the inducement level, and a
+// continuation arrow once the move resumes. Only the actionable phases are drawn.
+//
+// When the sequence's TF == the current chart ("native"), objects anchor at their
+// REAL bar times (OB at its origin candle, inducement at its pivot), so each
+// timeframe's picture sits correctly on its own chart. When projecting a different
+// TF onto this chart (ALL scope), prices are valid across TFs but the bar times are
+// not, so those use horizontal segments spanning a fixed window instead.
+void DrawLiqObjects(LiqSequence &s) {
+    DeleteLiqObjects(s);
+    if(!InpLiqDrawObjects) return;
+    if(!s.active || s.dir == 0)                        return;
+    if(s.state == SEQ_IDLE || s.state == SEQ_INVALID)  return;
 
-    for(int i = 0; i < g_fbcCount; i++) {
-        if(!fresh[i]) continue;
-        string tag      = g_fbcTag[i];
-        bool   tradable = PeriodSeconds(g_fbc[i].tf) >= PeriodSeconds(minTF);
+    color    cDir   = (s.dir == BULLISH) ? InpLiqBullColor : InpLiqBearColor;
+    string   b      = LiqObjBase(s);
+    string   chTag  = s.internalCh ? "INT" : "EXT";
+    datetime nowT   = iTime(_Symbol, _Period, 0);
+    datetime rightT = nowT + PeriodSeconds(_Period) * 12;
+    datetime projL  = nowT - PeriodSeconds(_Period) * 220;
 
-        for(int k = 0; k < 2; k++) {
-            int dir = (k == 0) ? FBC_SELL : FBC_BUY;
-            if(!FBC_SideOn(dir)) continue;
+    bool     native  = (s.tf == _Period);
+    datetime obLeft  = (native && s.obTime     > 0) ? s.obTime     : projL;
+    datetime indLeft = (native && s.induceTime > 0) ? s.induceTime : projL;
 
-            bool pat = (dir == FBC_SELL) ? g_fbc[i].sell.now : g_fbc[i].buy.now;
-            if(!pat) continue;                                   // only completed patterns act
+    if(s.obValid) {
+        DrawTrend(b + "obT", obLeft, s.obTop,    rightT, s.obTop,    cDir, STYLE_SOLID, 1, false);
+        DrawTrend(b + "obB", obLeft, s.obBottom, rightT, s.obBottom, cDir, STYLE_SOLID, 1, false);
+        DrawText (b + "obtx", rightT, s.obTop, s.tag + " " + chTag + " OB", cDir, 7, ANCHOR_LEFT);
+    }
+    if(s.induceLevel > 0) {
+        DrawTrend(b + "ind", indLeft, s.induceLevel, rightT, s.induceLevel,
+                  InpLiqInduceColor, STYLE_DOT, 1, false);
+        DrawText (b + "indtx", rightT, s.induceLevel,
+                  s.tag + " induce" + (s.induceSwept ? " (swept)" : ""),
+                  InpLiqInduceColor, 7, ANCHOR_LEFT);
+    }
+    if(s.state == SEQ_CONTINUATION) {
+        string   an = b + "arr";
+        double   ap = (s.dir == BULLISH) ? s.obBottom : s.obTop;
+        datetime at = (native && s.contBarTime > 0) ? s.contBarTime : iTime(_Symbol, _Period, 1);
+        if(ObjectFind(0, an) < 0) ObjectCreate(0, an, OBJ_ARROW, 0, at, ap);
+        ObjectMove(0, an, 0, at, ap);
+        ObjectSetInteger(0, an, OBJPROP_ARROWCODE,  (s.dir == BULLISH) ? 233 : 234);
+        ObjectSetInteger(0, an, OBJPROP_COLOR,      cDir);
+        ObjectSetInteger(0, an, OBJPROP_WIDTH,      2);
+        ObjectSetInteger(0, an, OBJPROP_SELECTABLE, false);
+        ObjectSetInteger(0, an, OBJPROP_HIDDEN,     true);
+    }
+}
 
-            double fail   = (dir == FBC_SELL) ? g_fbc[i].sell.fail   : g_fbc[i].buy.fail;
-            double origin = (dir == FBC_SELL) ? g_fbc[i].sell.origin : g_fbc[i].buy.origin;
+void DeleteLiqPanel() { DeleteByPrefix(OBJ_PREFIX + "lqp_"); }
 
-            // Higher-TF context (for the SETUP line) and opposing veto.
-            int    ctxIdx = -1, oppIdx = -1;
-            string ctxList = "", oppList = "";
-            int    ctx = FBC_HigherSetups(i, dir,  ctxIdx, ctxList);
-            int    opp = FBC_HigherSetups(i, -dir, oppIdx, oppList);
+// Compact second panel, one row per (TF × channel), placed below the MTF panel.
+void RefreshLiqPanel() {
+    if(!InpLiqEnable) { DeleteLiqPanel(); return; }
 
-            //--- SETUP push: fires once for every completed pattern, labelled.
-            if(InpFBC_AlertEveryTF)
-                FBC_Notify(StringFormat("[SETUP] %s %s failed CHoCH | %s %s | target %s | HTF %s setups: %s",
-                                        tag, FBC_Side(dir), (dir == FBC_SELL ? "LH" : "HL"), FBC_Px(fail),
-                                        FBC_Px(origin), FBC_Side(dir), ctx > 0 ? ctxList : "none"));
+    int fs   = InpPanelFontSize;
+    int rowH = fs + 8;
+    int x0   = InpPanelX;
+    int mtfH = rowH * (MTF_COUNT + 3) + 10;
+    int y0   = InpPanelY + (InpShowMTFPanel ? mtfH + InpLiqPanelGap : 0);
 
-            //--- ENTRY: every completed pattern on a tradable TF opens a trade.
-            string block = "";
-            if(!tradable)                              block = "below min trade TF";
-            else if(traded)                            block = "already acted this tick";
-            else if(InpFBC_BlockOpposing && opp > 0)   block = "opposing " + oppList + " setup active";
+    int cTF = 0, cCh = 42, cDir = 82, cPh = 128, cInd = 196, cOB = 272, cTr = 362;
+    int panelW = cTr + 72;
 
-            if(StringLen(block) > 0) {
-                Print("[SMC-FBC] ", tag, " ", FBC_Side(dir),
-                      " completed but not traded — ", block);
+    int chRows = (InpLiqTrackInternal ? 1 : 0) + (InpLiqTrackSwing ? 1 : 0);
+    int rows   = g_liqTFCount * chRows;
+    int panelH = rowH * (rows + 3) + 10;
+
+    PanelBG(OBJ_PREFIX + "lqp_bg", x0 - 6, y0 - 6, panelW, panelH, InpPanelBgColor);
+    PanelLabel(OBJ_PREFIX + "lqp_title", x0, y0, "LIQUIDITY SEQUENCE  " + _Symbol, clrWhite, fs);
+
+    int hy = y0 + rowH;
+    PanelLabel(OBJ_PREFIX + "lqp_h_tf",  x0 + cTF,  hy, "TF",     InpPanelTextColor, fs);
+    PanelLabel(OBJ_PREFIX + "lqp_h_ch",  x0 + cCh,  hy, "Ch",     InpPanelTextColor, fs);
+    PanelLabel(OBJ_PREFIX + "lqp_h_dir", x0 + cDir, hy, "Dir",    InpPanelTextColor, fs);
+    PanelLabel(OBJ_PREFIX + "lqp_h_ph",  x0 + cPh,  hy, "Phase",  InpPanelTextColor, fs);
+    PanelLabel(OBJ_PREFIX + "lqp_h_ind", x0 + cInd, hy, "Induce", InpPanelTextColor, fs);
+    PanelLabel(OBJ_PREFIX + "lqp_h_ob",  x0 + cOB,  hy, "OB mid", InpPanelTextColor, fs);
+    PanelLabel(OBJ_PREFIX + "lqp_h_tr",  x0 + cTr,  hy, "Trig",   InpPanelTextColor, fs);
+
+    int r = 0;
+    for(int k = 0; k < g_liqTFCount; k++) {
+        for(int ch = 0; ch < LIQ_CH_COUNT; ch++) {
+            if(ch == 0 && !InpLiqTrackInternal) continue;
+            if(ch == 1 && !InpLiqTrackSwing)    continue;
+
+            LiqSequence s = g_liq[k][ch];
+            int ry = y0 + rowH * (r + 2); r++;
+            string id = IntegerToString(k) + "_" + IntegerToString(ch);
+            string dispTag = s.tag + ((k == g_liqCurRow) ? "*" : "");
+
+            PanelLabel(OBJ_PREFIX + "lqp_tf_" + id, x0 + cTF, ry, dispTag, clrWhite, fs);
+            PanelLabel(OBJ_PREFIX + "lqp_ch_" + id, x0 + cCh, ry, (ch == 0 ? "INT" : "EXT"),
+                       InpPanelTextColor, fs);
+
+            if(!s.active || s.dir == 0) {
+                PanelLabel(OBJ_PREFIX + "lqp_dir_" + id, x0 + cDir, ry, "-",    InpPanelDimColor, fs);
+                PanelLabel(OBJ_PREFIX + "lqp_ph_"  + id, x0 + cPh,  ry, "idle", InpPanelDimColor, fs);
+                PanelLabel(OBJ_PREFIX + "lqp_ind_" + id, x0 + cInd, ry, "-",    InpPanelDimColor, fs);
+                PanelLabel(OBJ_PREFIX + "lqp_ob_"  + id, x0 + cOB,  ry, "-",    InpPanelDimColor, fs);
+                PanelLabel(OBJ_PREFIX + "lqp_tr_"  + id, x0 + cTr,  ry, "-",    InpPanelDimColor, fs);
                 continue;
             }
 
-            FBC_Execute(i, dir, fail, origin);       // pushes [TRIGGERED] / [FAILED]
-            traded = true;                            // one entry decision per tick
+            color  dc = (s.dir == BULLISH) ? InpPanelBullColor : InpPanelBearColor;
+            string dt = (s.dir == BULLISH) ? "BULL" : "BEAR";
+            dt += s.isChoCH ? " C" : " B";
+            PanelLabel(OBJ_PREFIX + "lqp_dir_" + id, x0 + cDir, ry, dt, dc, fs);
+
+            color pc = InpPanelTextColor;
+            if(s.state == SEQ_CONTINUATION)   pc = dc;
+            else if(s.state == SEQ_MITIGATED) pc = clrGold;
+            else if(s.state == SEQ_INVALID)   pc = InpPanelDimColor;
+            PanelLabel(OBJ_PREFIX + "lqp_ph_" + id, x0 + cPh, ry, LiqPhaseText(s.state), pc, fs);
+
+            string indt = (s.induceLevel > 0) ? DoubleToString(s.induceLevel, _Digits) : "-";
+            PanelLabel(OBJ_PREFIX + "lqp_ind_" + id, x0 + cInd, ry, indt,
+                       s.induceSwept ? clrGold : InpPanelDimColor, fs);
+
+            string obt = s.obValid ? DoubleToString((s.obTop + s.obBottom) / 2.0, _Digits) : "-";
+            PanelLabel(OBJ_PREFIX + "lqp_ob_" + id, x0 + cOB, ry, obt, dc, fs);
+
+            string tr = (s.state == SEQ_CONTINUATION) ? "FIRED"
+                      : (s.state == SEQ_MITIGATED)    ? "ARMED" : "-";
+            color  trc = (s.state == SEQ_CONTINUATION) ? dc
+                       : (s.state == SEQ_MITIGATED)    ? clrGold : InpPanelDimColor;
+            PanelLabel(OBJ_PREFIX + "lqp_tr_" + id, x0 + cTr, ry, tr, trc, fs);
         }
     }
+
+    int fy = y0 + rowH * (rows + 2);
+    PanelLabel(OBJ_PREFIX + "lqp_foot", x0 + cTF, fy,
+               "C=CHoCH B=BOS | *=current chart | gold=swept / at OB | GO=move resuming",
+               InpPanelDimColor, MathMax(6, fs - 1));
 }
 
-//============================ LIFECYCLE =============================
-void FBC_AddEngine(bool on, ENUM_TIMEFRAMES tf) {
-    if(!on || g_fbcCount >= FBC_MAX_TF) return;
-    int i = g_fbcCount;
-    ZeroMemory(g_fbc[i]);
-    g_fbc[i].tf         = tf;
-    g_fbc[i].pivLen     = MathMax(1, PeriodSeconds(tf) >= PeriodSeconds(PERIOD_H1) ? InpFBC_PivotLenHigh
-                                                                                     : InpFBC_PivotLenLow);
-    g_fbc[i].bias       = NEUTRAL;
-    g_fbc[i].sell.state = FBC_IDLE;
-    g_fbc[i].buy.state  = FBC_IDLE;
-    g_fbc[i].atrHandle  = iATR(_Symbol, tf, 14);
-    g_fbcTag[i]         = StringSubstr(EnumToString(tf), 7);   // "PERIOD_H1" -> "H1"
-    g_fbcCount++;
-}
+// Recompute every (TF × channel), redraw chart objects + panel.
+// allowAlerts = true only on a closed CHART bar (OnTick new bar); false on load.
+void UpdateLiq(bool allowAlerts) {
+    if(!InpLiqEnable) { DeleteLiqPanel(); return; }
+    for(int k = 0; k < g_liqTFCount; k++) {
+        if(InpLiqTrackInternal)
+            LiqAnalyzeChannel(g_liqTF[k], InpLiqIntLength,   true,  g_liq[k][0], allowAlerts);
+        if(InpLiqTrackSwing)
+            LiqAnalyzeChannel(g_liqTF[k], InpLiqSwingLength, false, g_liq[k][1], allowAlerts);
 
-bool FBC_Backfill(int i) {
-    int N    = g_fbc[i].pivLen;
-    int bars = Bars(_Symbol, g_fbc[i].tf);
-    if(bars < 2 * N + 60) return false;               // history not synced yet — retried from OnTick
-
-    int K = MathMin(InpFBC_BackfillBars, bars - 2 * N - 10);
-    for(int s = K; s >= 1; s--) FBC_ProcessBar(g_fbc[i], g_fbcTag[i], s, false);
-
-    g_fbc[i].lastBar = iTime(_Symbol, g_fbc[i].tf, 0);
-    g_fbc[i].ready   = true;
-    PrintFormat("[SMC-FBC] %s backfilled %d bars — S: %s | B: %s", g_fbcTag[i], K,
-                FBC_SideText(g_fbc[i].sell, FBC_SELL), FBC_SideText(g_fbc[i].buy, FBC_BUY));
-    return true;
-}
-
-bool FBC_Init() {
-    g_fbcActive = false;
-    g_fbcCount  = 0;
-    g_fbcId     = 0;
-    if(!InpFBC_Enable || (!InpFBC_EnableSell && !InpFBC_EnableBuy)) return true;
-
-    // Highest timeframe first — FBC_HigherSetups and FBC_Evaluate rely on this order.
-    FBC_AddEngine(InpFBC_ScanW1,  PERIOD_W1);
-    FBC_AddEngine(InpFBC_ScanD1,  PERIOD_D1);
-    FBC_AddEngine(InpFBC_ScanH4,  PERIOD_H4);
-    FBC_AddEngine(InpFBC_ScanH1,  PERIOD_H1);
-    FBC_AddEngine(InpFBC_ScanM30, PERIOD_M30);
-    FBC_AddEngine(InpFBC_ScanM15, PERIOD_M15);
-    FBC_AddEngine(InpFBC_ScanM5,  PERIOD_M5);
-    FBC_AddEngine(InpFBC_ScanM1,  PERIOD_M1);
-
-    if(g_fbcCount == 0) {
-        Print("[SMC-FBC] No timeframes selected — module disabled");
-        return true;
-    }
-    for(int i = 0; i < g_fbcCount; i++)
-        if(g_fbc[i].atrHandle == INVALID_HANDLE) {
-            Print("[SMC-FBC] ATR handle failed on ", g_fbcTag[i]);
-            return false;
+        // each TF draws its own visuals: by default only the row matching the chart
+        // period draws; LIQ_SCOPE_ALL projects every tracked TF onto this chart.
+        bool drawThisTF = InpLiqDrawObjects &&
+                          (InpLiqDrawScope == LIQ_SCOPE_ALL || g_liqTF[k] == _Period);
+        for(int ch = 0; ch < LIQ_CH_COUNT; ch++) {
+            if(ch == 0 && !InpLiqTrackInternal) continue;
+            if(ch == 1 && !InpLiqTrackSwing)    continue;
+            if(drawThisTF) DrawLiqObjects(g_liq[k][ch]);
+            else           DeleteLiqObjects(g_liq[k][ch]);  // clear stale objects for non-current TFs
         }
-
-    g_fbcActive = true;
-    if(InpFBC_Trade && (!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)))
-        Print("[SMC-FBC] WARNING: auto-trade is ON but Algo Trading is disabled — signals will alert only until you enable it");
-    for(int i = 0; i < g_fbcCount; i++) FBC_Backfill(i);
-    FBC_DrawPanel();
-    return true;
-}
-
-void FBC_Deinit() {
-    for(int i = 0; i < g_fbcCount; i++)
-        if(g_fbc[i].atrHandle != INVALID_HANDLE) IndicatorRelease(g_fbc[i].atrHandle);
-    g_fbcActive = false;
-}
-
-// Call at the very TOP of OnTick (before the EA's new-bar early return).
-void FBC_OnTick() {
-    if(!g_fbcActive) return;
-
-    bool fresh[FBC_MAX_TF];
-    bool any = false;
-    for(int i = 0; i < FBC_MAX_TF; i++) fresh[i] = false;
-
-    for(int i = 0; i < g_fbcCount; i++) {       // highest TF first
-        if(!g_fbc[i].ready) { FBC_Backfill(i); continue; }
-        datetime t0 = iTime(_Symbol, g_fbc[i].tf, 0);
-        if(t0 == 0 || t0 == g_fbc[i].lastBar) continue;
-        g_fbc[i].lastBar = t0;
-        FBC_ProcessBar(g_fbc[i], g_fbcTag[i], 1, true);
-        fresh[i] = true;
-        any = true;
     }
-
-    if(!any) return;
-    FBC_Evaluate(fresh);
-    FBC_DrawPanel();
-    ChartRedraw();
+    RefreshLiqPanel();
 }
 
 //===================== HISTORICAL BACKFILL ==========================
+// Replay pivot detection, structure breaks, OB tracking, FVG detection
+// and trailing extremes over the most recent N closed bars so all the
+// historical structures show up immediately when the EA loads.
+//
+// Trading is never invoked here — RunTradingLogic is only called from
+// OnTick, so backfill cannot produce phantom historical entries.
 void BackfillHistory() {
     int totalBars = Bars(_Symbol, _Period);
-
-    int lookbackNeed = MathMax(InpSwingsLength,
-                               2 * MathMax(InpSnRPeriod, InpTLPeriod) + 5);
-    int scanBars = MathMin(InpBackfillBars, totalBars - lookbackNeed - 50);
-
-    if(scanBars < lookbackNeed * 2 + 50) {
+    int scanBars  = MathMin(InpBackfillBars, totalBars - InpSwingsLength - 50);
+    if(scanBars < InpSwingsLength * 2 + 50) {
         PrintFormat("[SMC] Backfill skipped — not enough history (%d bars available)", totalBars);
         return;
     }
@@ -2637,754 +2102,50 @@ void BackfillHistory() {
     PrintFormat("[SMC] Backfilling %d historical bars...", scanBars);
     uint t0 = GetTickCount();
 
+    // Walk old → new. At k=scanBars the "current closed bar" is the oldest
+    // we'll scan; at k=1 it's the most recent closed bar (live equivalent).
     for(int k = scanBars; k >= 1; k--) {
         g_scanShift = k - 1;
 
         ResetAlerts();            // suppress per-bar alerts during scan
         UpdateCumTR();
 
+        // Pivot capture (same calls as OnTick)
         GetCurrentStructure(InpSwingsLength, false, false);   // swing
         GetCurrentStructure(5,                false, true);    // internal
         if(InpShowEQHEQL)
             GetCurrentStructure(InpEQHEQLLength, true, false); // equal
 
+        // FVG: mitigate-then-detect at each historical bar so live state
+        // matches what would have happened if EA was running all along.
+        // Skipped automatically for MTF FVGs (see DrawFairValueGaps).
         if(InpShowFVG) {
             DeleteFairValueGaps();
             DrawFairValueGaps();
         }
 
+        // Structure breaks — also calls StoreOrderBlock internally.
         if(InpShowInternals || InpShowInternalOBs)
             DisplayStructure(true);
         if(InpShowStructure || InpShowSwingOBs || InpShowHighLowSwings)
             DisplayStructure(false);
 
+        // OB mitigation against the current scanned bar's range.
         if(InpShowInternalOBs) DeleteOrderBlocks(true);
         if(InpShowSwingOBs)    DeleteOrderBlocks(false);
 
+        // Trailing extremes accumulate bar-by-bar.
         if(InpShowHighLowSwings || InpShowPDZones)
             UpdateTrailingExtremes();
-
-        UpdateSmartSnR();
     }
 
     g_scanShift   = 0;
     g_lastBarTime = iTime(_Symbol, _Period, 0);  // prevent OnTick reprocessing the latest bar
     ResetAlerts();
 
-    PrintFormat("[SMC] Backfill done in %u ms — %d swing OBs, %d internal OBs, %d FVGs, %d R / %d S levels, TL up=%s lo=%s",
+    PrintFormat("[SMC] Backfill done in %u ms — %d swing OBs, %d internal OBs, %d active FVGs",
                 GetTickCount() - t0,
-                ArraySize(g_swingOBs), ArraySize(g_internalOBs), ArraySize(g_fvgs),
-                ArraySize(g_res), ArraySize(g_sup),
-                g_upperTL.valid ? "yes" : "no", g_lowerTL.valid ? "yes" : "no");
-}
-
-//====================================================================
-//  v1.22/1.23 — LIQUIDITY SWEEP TARGETS (PER TIMEFRAME)
-//  On each scanned TF: a minor (len InpLST_MinorPivot) CHoCH/BOS that
-//  does NOT take out that TF's major swing (len InpLST_MajorPivot) is
-//  treated as a liquidity sweep. The origin it came from is flagged as
-//  the high/low likely to be broken next.
-//    bullish minor break, major high intact -> target origin LOW  (dir -1)
-//    bearish minor break, major low  intact -> target origin HIGH (dir +1)
-//  Detection is per-TF (own bar closes + backfill); hit-management and
-//  drawing are chart-driven. Targets carry their source TF tag.
-//====================================================================
-#define LST_MAX_TF 8
-
-struct LQTarget {
-    double          price;
-    datetime        createdT;
-    int             dir;        // -1 low likely broken (down), +1 high likely broken (up)
-    bool            hit;
-    int             ageBars;
-    long            objId;
-    ENUM_TIMEFRAMES tf;
-    string          tag;
-};
-LQTarget g_lqTargets[];
-
-void LQ_RemoveAt(int i) {
-    SafeDelete(OBJ_PREFIX + "lq_"  + IntegerToString(g_lqTargets[i].objId));
-    SafeDelete(OBJ_PREFIX + "lqt_" + IntegerToString(g_lqTargets[i].objId));
-    for(int j = i; j < ArraySize(g_lqTargets) - 1; j++) g_lqTargets[j] = g_lqTargets[j + 1];
-    ArrayResize(g_lqTargets, ArraySize(g_lqTargets) - 1);
-}
-
-void LQ_AddTarget(double price, int dir, datetime t, bool live, ENUM_TIMEFRAMES tf, string tag) {
-    double atr = GetATR14(0);
-    double tol = (atr > 0.0) ? atr * 0.15 : 0.0;
-    double px  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-    for(int i = 0; i < ArraySize(g_lqTargets); i++)
-        if(!g_lqTargets[i].hit && g_lqTargets[i].dir == dir
-           && MathAbs(g_lqTargets[i].price - price) <= tol) return;   // dedup (same pool)
-
-    if(InpLST_MinDistATR > 0.0 && atr > 0.0 && MathAbs(px - price) < InpLST_MinDistATR * atr) return;
-
-    LQTarget r;
-    r.price = NormalizeDouble(price, _Digits);
-    r.dir = dir; r.createdT = t; r.hit = false; r.ageBars = 0;
-    r.tf = tf; r.tag = tag;
-    g_objCounter++; r.objId = g_objCounter;
-
-    int n = ArraySize(g_lqTargets);
-    ArrayResize(g_lqTargets, n + 1);
-    for(int i = n; i > 0; i--) g_lqTargets[i] = g_lqTargets[i - 1];
-    g_lqTargets[0] = r;
-
-    int cap = MathMax(1, InpLST_MaxTargets);
-    while(ArraySize(g_lqTargets) > cap) LQ_RemoveAt(ArraySize(g_lqTargets) - 1);
-
-    if(live && InpLST_AlertOnNew) {
-        string side = (dir < 0) ? "low" : "high";
-        string msg = StringFormat("%s liquidity sweep — likely to break %s at %s",
-                                  tag, side, DoubleToString(r.price, _Digits));
-        Print("[SMC-LQ] ", msg);
-        if(InpAlertsOn)     Alert("SMC " + _Symbol + ": " + msg);
-        if(InpPushNotifyOn) SendNotification("SMC " + _Symbol + ": " + msg);
-    }
-}
-
-// chart-driven hit + expiry pass
-void LQ_Manage(bool live) {
-    double hi = H(0), lo = L(0);
-    for(int i = ArraySize(g_lqTargets) - 1; i >= 0; i--) {
-        g_lqTargets[i].ageBars++;
-        bool hit = (g_lqTargets[i].dir < 0) ? (lo < g_lqTargets[i].price)
-                                            : (hi > g_lqTargets[i].price);
-        if(hit) {
-            if(live && InpLST_AlertOnHit) {
-                string side = (g_lqTargets[i].dir < 0) ? "low" : "high";
-                string msg = StringFormat("%s liquidity target reached — %s %s broken",
-                                          g_lqTargets[i].tag, side,
-                                          DoubleToString(g_lqTargets[i].price, _Digits));
-                Print("[SMC-LQ] ", msg);
-                if(InpAlertsOn)     Alert("SMC " + _Symbol + ": " + msg);
-                if(InpPushNotifyOn) SendNotification("SMC " + _Symbol + ": " + msg);
-            }
-            LQ_RemoveAt(i);
-            continue;
-        }
-        if(g_lqTargets[i].ageBars > InpLST_MaxBars) LQ_RemoveAt(i);
-    }
-}
-
-void LQ_Draw() {
-    if(!InpLST_Draw) return;
-    datetime rightT = iTime(_Symbol, _Period, 0) + PeriodSeconds(_Period) * 8;
-    for(int i = 0; i < ArraySize(g_lqTargets); i++) {
-        string ln = OBJ_PREFIX + "lq_"  + IntegerToString(g_lqTargets[i].objId);
-        string tx = OBJ_PREFIX + "lqt_" + IntegerToString(g_lqTargets[i].objId);
-        // show only this chart's TF (data for other TFs stays live, just not drawn)
-        bool show = (!InpShowCurrentTFOnly || g_lqTargets[i].tf == (ENUM_TIMEFRAMES)_Period);
-        if(g_lqTargets[i].hit || !show) { SafeDelete(ln); SafeDelete(tx); continue; }
-        color  c  = (g_lqTargets[i].dir < 0) ? InpLST_LowColor : InpLST_HighColor;
-        DrawTrend(ln, g_lqTargets[i].createdT, g_lqTargets[i].price, rightT, g_lqTargets[i].price,
-                  c, STYLE_DOT, 1, false);
-        DrawText(tx, rightT, g_lqTargets[i].price,
-                 g_lqTargets[i].tag + ((g_lqTargets[i].dir < 0) ? " sweep target (low) " : " sweep target (high) ")
-                 + DoubleToString(g_lqTargets[i].price, _Digits),
-                 c, 8, ANCHOR_LEFT);
-    }
-}
-
-void ProcessLiquiditySweeps(bool live) {   // chart-bar hit mgmt + redraw
-    if(!InpLST_Enable) return;
-    LQ_Manage(live);
-    LQ_Draw();
-}
-
-//------------------------- per-TF engines ---------------------------
-bool LST_IsPivotHigh(ENUM_TIMEFRAMES tf, int s, int N) {
-    int c = s + N; double v = iHigh(_Symbol, tf, c);
-    if(v <= 0) return false;
-    for(int i = 1; i <= N; i++) {
-        if(iHigh(_Symbol, tf, c + i) >= v) return false;
-        if(iHigh(_Symbol, tf, c - i) >= v) return false;
-    }
-    return true;
-}
-bool LST_IsPivotLow(ENUM_TIMEFRAMES tf, int s, int N) {
-    int c = s + N; double v = iLow(_Symbol, tf, c);
-    if(v <= 0) return false;
-    for(int i = 1; i <= N; i++) {
-        if(iLow(_Symbol, tf, c + i) <= v) return false;
-        if(iLow(_Symbol, tf, c - i) <= v) return false;
-    }
-    return true;
-}
-
-struct LSTEngine {
-    ENUM_TIMEFRAMES tf;
-    int      minorN, majorN;
-    datetime lastBar;
-    bool     ready;
-    double   mPh; datetime mPhT; bool mPhX;    // minor pivot high
-    double   mPl; datetime mPlT; bool mPlX;    // minor pivot low
-    int      mBias;
-    double   MPh; datetime MPhT;               // major pivot high (level only)
-    double   MPl; datetime MPlT;               // major pivot low
-    int      atrHandle;
-};
-LSTEngine g_lst[LST_MAX_TF];
-string    g_lstTag[LST_MAX_TF];
-int       g_lstCount  = 0;
-bool      g_lstActive = false;
-
-void LST_ProcessBar(LSTEngine &e, string tag, int s, bool live) {
-    // major pivots (levels for the "intact" test)
-    if(LST_IsPivotHigh(e.tf, s, e.majorN)) { e.MPh = iHigh(_Symbol, e.tf, s + e.majorN); e.MPhT = iTime(_Symbol, e.tf, s + e.majorN); }
-    if(LST_IsPivotLow (e.tf, s, e.majorN)) { e.MPl = iLow (_Symbol, e.tf, s + e.majorN); e.MPlT = iTime(_Symbol, e.tf, s + e.majorN); }
-
-    // minor pivots (the sweeping structure)
-    if(LST_IsPivotHigh(e.tf, s, e.minorN)) { e.mPh = iHigh(_Symbol, e.tf, s + e.minorN); e.mPhT = iTime(_Symbol, e.tf, s + e.minorN); e.mPhX = false; }
-    if(LST_IsPivotLow (e.tf, s, e.minorN)) { e.mPl = iLow (_Symbol, e.tf, s + e.minorN); e.mPlT = iTime(_Symbol, e.tf, s + e.minorN); e.mPlX = false; }
-
-    double c = iClose(_Symbol, e.tf, s);
-    if(c <= 0) return;
-
-    // bullish minor break
-    if(e.mPh > 0.0 && !e.mPhX && c > e.mPh) {
-        bool   choch  = (e.mBias == BEARISH);
-        double origin = e.mPl;                       // low the up-move came from
-        bool   act    = choch || !InpLST_CHoCHOnly;
-        bool   intact = (e.MPh > 0.0 && c < e.MPh);  // major swing high not taken
-        if(act && intact && origin > 0.0 && origin < c)
-            LQ_AddTarget(origin, -1, iTime(_Symbol, e.tf, s), live, e.tf, tag);
-        e.mPhX = true; e.mBias = BULLISH;
-    }
-    // bearish minor break
-    if(e.mPl > 0.0 && !e.mPlX && c < e.mPl) {
-        bool   choch  = (e.mBias == BULLISH);
-        double origin = e.mPh;                       // high the down-move came from
-        bool   act    = choch || !InpLST_CHoCHOnly;
-        bool   intact = (e.MPl > 0.0 && c > e.MPl);  // major swing low not taken
-        if(act && intact && origin > 0.0 && origin > c)
-            LQ_AddTarget(origin, +1, iTime(_Symbol, e.tf, s), live, e.tf, tag);
-        e.mPlX = true; e.mBias = BEARISH;
-    }
-}
-
-void LST_AddEngine(bool on, ENUM_TIMEFRAMES tf) {
-    if(!on || g_lstCount >= LST_MAX_TF) return;
-    int i = g_lstCount;
-    ZeroMemory(g_lst[i]);
-    g_lst[i].tf        = tf;
-    g_lst[i].minorN    = MathMax(1, InpLST_MinorPivot);
-    g_lst[i].majorN    = MathMax(g_lst[i].minorN + 1, InpLST_MajorPivot);
-    g_lst[i].mBias     = NEUTRAL;
-    g_lst[i].atrHandle = iATR(_Symbol, tf, 14);
-    g_lstTag[i]        = StringSubstr(EnumToString(tf), 7);
-    g_lstCount++;
-}
-
-bool LST_Backfill(int i) {
-    int N    = g_lst[i].majorN;
-    int bars = Bars(_Symbol, g_lst[i].tf);
-    if(bars < 2 * N + 40) return false;
-    int K = MathMin(InpLST_BackfillBars, bars - 2 * N - 10);
-    for(int s = K; s >= 1; s--) LST_ProcessBar(g_lst[i], g_lstTag[i], s, false);
-    g_lst[i].lastBar = iTime(_Symbol, g_lst[i].tf, 0);
-    g_lst[i].ready   = true;
-    return true;
-}
-
-// Drop historical targets that price has already traded through (chart TF).
-void LST_CleanupBackfilled() {
-    for(int i = ArraySize(g_lqTargets) - 1; i >= 0; i--) {
-        int sh = iBarShift(_Symbol, _Period, g_lqTargets[i].createdT, false);
-        int cnt = sh - 1;                       // bars after creation, up to last closed
-        if(cnt < 1) continue;
-        bool hit;
-        if(g_lqTargets[i].dir < 0) {
-            int idx = iLowest(_Symbol, _Period, MODE_LOW, cnt, 1);
-            hit = (idx >= 0 && iLow(_Symbol, _Period, idx) < g_lqTargets[i].price);
-        } else {
-            int idx = iHighest(_Symbol, _Period, MODE_HIGH, cnt, 1);
-            hit = (idx >= 0 && iHigh(_Symbol, _Period, idx) > g_lqTargets[i].price);
-        }
-        if(hit) LQ_RemoveAt(i);
-    }
-}
-
-bool LST_Init() {
-    g_lstActive = false; g_lstCount = 0;
-    if(!InpLST_Enable) return true;
-    LST_AddEngine(InpLST_ScanW1,  PERIOD_W1);
-    LST_AddEngine(InpLST_ScanD1,  PERIOD_D1);
-    LST_AddEngine(InpLST_ScanH4,  PERIOD_H4);
-    LST_AddEngine(InpLST_ScanH1,  PERIOD_H1);
-    LST_AddEngine(InpLST_ScanM30, PERIOD_M30);
-    LST_AddEngine(InpLST_ScanM15, PERIOD_M15);
-    LST_AddEngine(InpLST_ScanM5,  PERIOD_M5);
-    if(g_lstCount == 0) return true;
-    g_lstActive = true;
-    for(int i = 0; i < g_lstCount; i++) LST_Backfill(i);
-    LST_CleanupBackfilled();
-    LQ_Draw();
-    return true;
-}
-
-void LST_Deinit() {
-    for(int i = 0; i < g_lstCount; i++)
-        if(g_lst[i].atrHandle != INVALID_HANDLE) IndicatorRelease(g_lst[i].atrHandle);
-    g_lstActive = false;
-}
-
-void LST_OnTick() {   // per-TF detection on each TF's bar close
-    if(!g_lstActive) return;
-    for(int i = 0; i < g_lstCount; i++) {
-        if(!g_lst[i].ready) { LST_Backfill(i); continue; }
-        datetime t0 = iTime(_Symbol, g_lst[i].tf, 0);
-        if(t0 == 0 || t0 == g_lst[i].lastBar) continue;
-        g_lst[i].lastBar = t0;
-        LST_ProcessBar(g_lst[i], g_lstTag[i], 1, true);
-    }
-}
-
-
-//====================================================================
-//  v1.18 — MTF TRENDLINE TABLE  (merged in — was MTF_TrendlineTable.mqh)
-//  One trendline engine per timeframe, reusing the v1.12 construction.
-//  upper line = descending lower-highs -> BEAR ; lower = higher-lows -> BULL
-//====================================================================
-#define MTL_MAX_TF   8
-
-input group "═══ MTF TRENDLINE TABLE ═══"
-input bool             InpMTL_Enable           = true;
-input bool             InpMTL_UseChartTLPeriod = true;          // Use chart InpTLPeriod on every TF
-input int              InpMTL_Period           = 20;            // Pivot period if the above is false
-input bool             InpMTL_ScanM5           = false;         // Scan M5
-input bool             InpMTL_ScanM15          = true;          // Scan M15
-input bool             InpMTL_ScanM30          = true;          // Scan M30
-input bool             InpMTL_ScanH1           = true;          // Scan H1
-input bool             InpMTL_ScanH4           = true;          // Scan H4
-input bool             InpMTL_ScanD1           = true;          // Scan D1
-input bool             InpMTL_ScanW1           = false;         // Scan W1
-input int              InpMTL_BackfillBars     = 1500;          // Per-TF history replay on load
-input bool             InpMTL_ShowPanel        = true;
-input ENUM_BASE_CORNER InpMTL_Corner           = CORNER_LEFT_LOWER;
-input int              InpMTL_FontSize          = 8;
-
-//============================ STATE =================================
-struct MTLEngine {
-    ENUM_TIMEFRAMES tf;
-    int      period;
-    int      atrHandle;
-    datetime lastBar;
-    bool     ready;
-    // pivot bookkeeping (mirrors g_tlPh* / g_tlPl*)
-    double   phVal, phVal1;  datetime phT, phT1;
-    double   plVal, plVal1;  datetime plT, plT1;
-    TLine    upper;          // descending resistance = BEAR trendline
-    TLine    lower;          // ascending  support    = BULL trendline
-    double   invalBuy, invalSell;  // v1.21 — this TF's own invalidation levels
-};
-
-MTLEngine g_mtl[MTL_MAX_TF];      // sorted HIGHEST timeframe first
-string    g_mtlTag[MTL_MAX_TF];
-int       g_mtlCount  = 0;
-bool      g_mtlActive = false;
-
-//============================ PIVOTS ================================
-double MTL_SrcHigh(ENUM_TIMEFRAMES tf, int sh) {
-    return (InpTLSource == TL_SHADOW) ? iHigh(_Symbol, tf, sh) : iClose(_Symbol, tf, sh);
-}
-double MTL_SrcLow(ENUM_TIMEFRAMES tf, int sh) {
-    return (InpTLSource == TL_SHADOW) ? iLow(_Symbol, tf, sh) : iClose(_Symbol, tf, sh);
-}
-
-bool MTL_IsPivotHigh(ENUM_TIMEFRAMES tf, int s, int N) {
-    int c = s + N;
-    double v = MTL_SrcHigh(tf, c);
-    if(v <= 0) return false;
-    for(int i = 1; i <= N; i++) {
-        if(MTL_SrcHigh(tf, c + i) >= v) return false;
-        if(MTL_SrcHigh(tf, c - i) >= v) return false;
-    }
-    return true;
-}
-bool MTL_IsPivotLow(ENUM_TIMEFRAMES tf, int s, int N) {
-    int c = s + N;
-    double v = MTL_SrcLow(tf, c);
-    if(v <= 0) return false;
-    for(int i = 1; i <= N; i++) {
-        if(MTL_SrcLow(tf, c + i) <= v) return false;
-        if(MTL_SrcLow(tf, c - i) <= v) return false;
-    }
-    return true;
-}
-
-double MTL_ATR(MTLEngine &e) {
-    if(e.atrHandle == INVALID_HANDLE) return 0.0;
-    double b[];
-    if(CopyBuffer(e.atrHandle, 0, 1, 1, b) < 1) return 0.0;
-    return b[0];
-}
-
-//============================ ENGINE ================================
-// Process one CLOSED bar at shift s (s>=1). Pivots confirm at shift s+period,
-// so the forming bar (shift 0) is never used — no repaint.
-void MTL_ProcessBar(MTLEngine &e, int s) {
-    int P  = e.period;
-    int cH = s + P;
-
-    if(MTL_IsPivotHigh(e.tf, s, P)) {
-        e.phVal1 = e.phVal;  e.phT1 = e.phT;
-        e.phVal  = MTL_SrcHigh(e.tf, cH);
-        e.phT    = iTime(_Symbol, e.tf, cH);
-        if(e.phT1 > 0 && e.phVal < e.phVal1) {           // lower high -> descending (bear) line
-            e.upper.valid = true;
-            e.upper.t1 = e.phT1;  e.upper.p1 = e.phVal1;
-            e.upper.t2 = e.phT;   e.upper.p2 = e.phVal;
-            double dt = (double)((long)e.upper.t2 - (long)e.upper.t1);
-            e.upper.slope = (dt != 0.0) ? (e.upper.p2 - e.upper.p1) / dt : 0.0;
-        }
-    }
-    if(MTL_IsPivotLow(e.tf, s, P)) {
-        e.plVal1 = e.plVal;  e.plT1 = e.plT;
-        e.plVal  = MTL_SrcLow(e.tf, cH);
-        e.plT    = iTime(_Symbol, e.tf, cH);
-        if(e.plT1 > 0 && e.plVal > e.plVal1) {           // higher low -> ascending (bull) line
-            e.lower.valid = true;
-            e.lower.t1 = e.plT1;  e.lower.p1 = e.plVal1;
-            e.lower.t2 = e.plT;   e.lower.p2 = e.plVal;
-            double dt = (double)((long)e.lower.t2 - (long)e.lower.t1);
-            e.lower.slope = (dt != 0.0) ? (e.lower.p2 - e.lower.p1) / dt : 0.0;
-        }
-    }
-}
-
-//============================ STATUS ================================
-// side +1 = bull (lower) line, -1 = bear (upper) line.
-// returns 0 absent, +1 respected/holding, -1 broken.
-int MTL_LineState(MTLEngine &e, int side, double px, double tol) {
-    TLine tl = (side > 0) ? e.lower : e.upper;
-    if(!tl.valid) return 0;
-    double val = TLValueAt(tl, TimeCurrent());
-    if(side > 0) return (px >= val - tol) ? +1 : -1;     // bull support holds while price above it
-    else         return (px <= val + tol) ? +1 : -1;     // bear resistance holds while price below it
-}
-
-// Transparent strength score. Respect dominates (an intact line always beats a
-// broken one); among intact lines the fresher + steeper one wins.
-double MTL_Score(MTLEngine &e, int side, double px, double tol) {
-    TLine tl = (side > 0) ? e.lower : e.upper;
-    if(!tl.valid) return -1000.0;
-    int    st       = MTL_LineState(e, side, px, tol);
-    double respect  = (st > 0) ? 1.0 : -0.5;
-    int    barsSince = iBarShift(_Symbol, e.tf, tl.t2, false);
-    if(barsSince < 0) barsSince = 999;
-    double recency  = 1.0 / (1.0 + barsSince);
-    double atr      = MTL_ATR(e);
-    double perBar   = MathAbs(tl.slope) * (double)PeriodSeconds(e.tf);
-    double steep    = (atr > 0) ? MathMin(perBar / atr, 1.0) : 0.0;
-    return respect * 2.0 + recency * 1.0 + steep * 1.0;
-}
-
-// Per-TF directional vote: +1 bullish, -1 bearish, 0 none.
-//  bull line holding -> bullish ; failing -> bearish
-//  bear line holding -> bearish ; broken  -> bullish
-// When both lines exist, the stronger line's state decides.
-int MTL_Vote(MTLEngine &e, double px, double tol) {
-    bool hasB = e.lower.valid, hasR = e.upper.valid;
-    if(hasB && hasR) {
-        double scB = MTL_Score(e, +1, px, tol);
-        double scR = MTL_Score(e, -1, px, tol);
-        int side = (scB >= scR) ? +1 : -1;
-        int st   = MTL_LineState(e, side, px, tol);
-        if(side > 0) return (st > 0) ? +1 : -1;
-        else         return (st > 0) ? -1 : +1;
-    }
-    if(hasB) { int st = MTL_LineState(e, +1, px, tol); return (st > 0) ? +1 : -1; }
-    if(hasR) { int st = MTL_LineState(e, -1, px, tol); return (st > 0) ? -1 : +1; }
-    return 0;
-}
-
-//============================ PANEL =================================
-void MTL_PanelLine(int row, string txt, color c) {
-    string nm = OBJ_PREFIX + "mtlPanel_" + IntegerToString(row);
-    if(ObjectFind(0, nm) < 0) ObjectCreate(0, nm, OBJ_LABEL, 0, 0, 0);
-    bool lower = (InpMTL_Corner == CORNER_LEFT_LOWER  || InpMTL_Corner == CORNER_RIGHT_LOWER);
-    bool right = (InpMTL_Corner == CORNER_RIGHT_UPPER || InpMTL_Corner == CORNER_RIGHT_LOWER);
-    ObjectSetInteger(0, nm, OBJPROP_CORNER,    InpMTL_Corner);
-    ObjectSetInteger(0, nm, OBJPROP_ANCHOR,
-                     right ? (lower ? ANCHOR_RIGHT_LOWER : ANCHOR_RIGHT_UPPER)
-                           : (lower ? ANCHOR_LEFT_LOWER  : ANCHOR_LEFT_UPPER));
-    ObjectSetInteger(0, nm, OBJPROP_XDISTANCE, 10);
-    ObjectSetInteger(0, nm, OBJPROP_YDISTANCE, 18 + row * (InpMTL_FontSize + 6));
-    ObjectSetString (0, nm, OBJPROP_TEXT,      txt);
-    ObjectSetString (0, nm, OBJPROP_FONT,      "Consolas");
-    ObjectSetInteger(0, nm, OBJPROP_FONTSIZE,  InpMTL_FontSize);
-    ObjectSetInteger(0, nm, OBJPROP_COLOR,     c);
-    ObjectSetInteger(0, nm, OBJPROP_SELECTABLE,false);
-    ObjectSetInteger(0, nm, OBJPROP_HIDDEN,    true);
-}
-
-//---------------- per-TF invalidation level (v1.21) -----------------
-// Each engine's own buy floor / sell ceiling from THIS TF's trendline +
-// structure (or S/R), buffered by this TF's ATR. S/R is chart-wide, so
-// only the TL and structure parts are genuinely per-TF.
-void MTL_ComputeInval(MTLEngine &e) {
-    e.invalBuy = 0.0; e.invalSell = 0.0;
-    if(!InpInvalEnable) return;
-
-    double px  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    double buf = MTL_ATR(e) * InpInvalBufferATR;                 // buffer scaled to this TF
-    double bl  = e.lower.valid ? TLValueAt(e.lower, TimeCurrent()) : 0.0;   // bull (support) TL
-    double br  = e.upper.valid ? TLValueAt(e.upper, TimeCurrent()) : 0.0;   // bear (resistance) TL
-    double sl  = (e.plVal > 0.0) ? e.plVal : 0.0;                // structure low
-    double sh  = (e.phVal > 0.0) ? e.phVal : 0.0;                // structure high
-    double buy = 0.0, sell = 0.0;
-
-    switch(InpInvalSource) {
-        case INVAL_MANUAL:
-            buy = InpInvalBuyBelow;  sell = InpInvalSellAbove;
-            break;
-        case INVAL_SWING:
-            buy  = (sl > 0.0) ? sl - buf : 0.0;
-            sell = (sh > 0.0) ? sh + buf : 0.0;
-            break;
-        case INVAL_TRENDLINE:
-            buy  = (bl > 0.0) ? bl - buf : 0.0;
-            sell = (br > 0.0) ? br + buf : 0.0;
-            break;
-        case INVAL_SNR: {
-            double s = 0.0, r = 0.0;
-            for(int k = 0; k < ArraySize(g_sup); k++) if(g_sup[k].price > 0.0 && g_sup[k].price < px) { s = g_sup[k].price; break; }
-            for(int k = 0; k < ArraySize(g_res); k++) if(g_res[k].price > 0.0 && g_res[k].price > px) { r = g_res[k].price; break; }
-            buy  = (s > 0.0) ? s - buf : 0.0;
-            sell = (r > 0.0) ? r + buf : 0.0;
-            break;
-        }
-        case INVAL_TL_AND_SWING: {
-            double cb1 = (bl > 0.0) ? bl - buf : 0.0;
-            double cb2 = (sl > 0.0) ? sl - buf : 0.0;
-            if(cb1 <= 0.0)      buy = cb2;
-            else if(cb2 <= 0.0) buy = cb1;
-            else                buy = (InpInvalCombine == INVAL_WIDEST) ? MathMin(cb1, cb2) : MathMax(cb1, cb2);
-            double cs1 = (br > 0.0) ? br + buf : 0.0;
-            double cs2 = (sh > 0.0) ? sh + buf : 0.0;
-            if(cs1 <= 0.0)      sell = cs2;
-            else if(cs2 <= 0.0) sell = cs1;
-            else                sell = (InpInvalCombine == INVAL_WIDEST) ? MathMax(cs1, cs2) : MathMin(cs1, cs2);
-            break;
-        }
-    }
-    e.invalBuy  = (buy  > 0.0) ? NormalizeDouble(buy,  _Digits) : 0.0;
-    e.invalSell = (sell > 0.0) ? NormalizeDouble(sell, _Digits) : 0.0;
-}
-
-void MTL_DrawPanel() {
-    if(!g_mtlActive || !InpMTL_ShowPanel) {
-        for(int r = 0; r < MTL_MAX_TF + 4; r++) SafeDelete(OBJ_PREFIX + "mtlPanel_" + IntegerToString(r));
-        return;
-    }
-
-    double px  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    double tol = 0.0;
-    double a14[];
-    if(g_atr14Handle != INVALID_HANDLE && CopyBuffer(g_atr14Handle, 0, 1, 1, a14) >= 1)
-        tol = a14[0] * 0.1;   // treat "within 10% of ATR" as still sitting on the line
-
-    string lines[];  color lc[];
-    ArrayResize(lines, g_mtlCount + 3);
-    ArrayResize(lc,    g_mtlCount + 3);
-    int n = 0;
-
-    lines[n] = "MTF TRENDLINES  " + _Symbol;  lc[n] = clrSilver; n++;
-
-    double netVote = 0.0;
-    for(int i = 0; i < g_mtlCount; i++) {
-        int sb = MTL_LineState(g_mtl[i], +1, px, tol);
-        int sr = MTL_LineState(g_mtl[i], -1, px, tol);
-        string bearTxt = (!g_mtl[i].upper.valid) ? "--  " : (sr > 0 ? "HOLD" : "BRK ");
-        string bullTxt = (!g_mtl[i].lower.valid) ? "--  " : (sb > 0 ? "HOLD" : "BRK ");
-
-        string strong = "-";
-        if(g_mtl[i].lower.valid && g_mtl[i].upper.valid) {
-            double scB = MTL_Score(g_mtl[i], +1, px, tol);
-            double scR = MTL_Score(g_mtl[i], -1, px, tol);
-            strong = (scB > scR) ? "BULL" : (scR > scB ? "BEAR" : "=");
-        } else if(g_mtl[i].lower.valid) strong = "BULL";
-        else if(g_mtl[i].upper.valid)   strong = "BEAR";
-
-        int   vote = MTL_Vote(g_mtl[i], px, tol);
-        color rowc = (vote > 0) ? clrLimeGreen : (vote < 0 ? clrTomato : clrSilver);
-        netVote += vote * MathLog((double)PeriodSeconds(g_mtl[i].tf));   // higher TF = heavier
-
-        MTL_ComputeInval(g_mtl[i]);
-        string invTxt = " | inv B<" + (g_mtl[i].invalBuy  > 0.0 ? DoubleToString(g_mtl[i].invalBuy,  _Digits) : "--")
-                      + " S>"       + (g_mtl[i].invalSell > 0.0 ? DoubleToString(g_mtl[i].invalSell, _Digits) : "--");
-
-        string tag = g_mtlTag[i];
-        while(StringLen(tag) < 3) tag += " ";
-        lines[n] = tag + "  bear:" + bearTxt + " bull:" + bullTxt + "  -> " + strong + invTxt;
-        lc[n] = rowc; n++;
-    }
-
-    int netSign = (netVote > 0.0001) ? +1 : (netVote < -0.0001 ? -1 : 0);
-    lines[n] = (netSign > 0) ? "NET BIAS: BULLISH (lean BUY)"
-             : (netSign < 0) ? "NET BIAS: BEARISH (lean SELL)"
-                             : "NET BIAS: MIXED (stand aside)";
-    lc[n] = (netSign > 0) ? clrLimeGreen : (netSign < 0 ? clrTomato : clrGold);
-    n++;
-
-    bool lowerCorner = (InpMTL_Corner == CORNER_LEFT_LOWER || InpMTL_Corner == CORNER_RIGHT_LOWER);
-    for(int r = 0; r < n; r++)
-        MTL_PanelLine(lowerCorner ? (n - 1 - r) : r, lines[r], lc[r]);
-    for(int r = n; r < MTL_MAX_TF + 4; r++)
-        SafeDelete(OBJ_PREFIX + "mtlPanel_" + IntegerToString(r));
-}
-
-//============================ LIFECYCLE =============================
-void MTL_AddEngine(bool on, ENUM_TIMEFRAMES tf) {
-    if(!on || g_mtlCount >= MTL_MAX_TF) return;
-    int i = g_mtlCount;
-    ZeroMemory(g_mtl[i]);
-    g_mtl[i].tf        = tf;
-    g_mtl[i].period    = InpMTL_UseChartTLPeriod ? MathMax(1, InpTLPeriod) : MathMax(1, InpMTL_Period);
-    g_mtl[i].atrHandle = iATR(_Symbol, tf, 14);
-    g_mtlTag[i]        = StringSubstr(EnumToString(tf), 7);   // "PERIOD_H4" -> "H4"
-    g_mtlCount++;
-}
-
-bool MTL_Backfill(int i) {
-    int P    = g_mtl[i].period;
-    int bars = Bars(_Symbol, g_mtl[i].tf);
-    if(bars < 2 * P + 30) return false;                      // history not synced yet
-    int K = MathMin(InpMTL_BackfillBars, bars - 2 * P - 10);
-    for(int s = K; s >= 1; s--) MTL_ProcessBar(g_mtl[i], s);
-    g_mtl[i].lastBar = iTime(_Symbol, g_mtl[i].tf, 0);
-    g_mtl[i].ready   = true;
-    return true;
-}
-
-bool MTL_Init() {
-    g_mtlActive = false;
-    g_mtlCount  = 0;
-    if(!InpMTL_Enable) return true;
-
-    // Highest timeframe first.
-    MTL_AddEngine(InpMTL_ScanW1,  PERIOD_W1);
-    MTL_AddEngine(InpMTL_ScanD1,  PERIOD_D1);
-    MTL_AddEngine(InpMTL_ScanH4,  PERIOD_H4);
-    MTL_AddEngine(InpMTL_ScanH1,  PERIOD_H1);
-    MTL_AddEngine(InpMTL_ScanM30, PERIOD_M30);
-    MTL_AddEngine(InpMTL_ScanM15, PERIOD_M15);
-    MTL_AddEngine(InpMTL_ScanM5,  PERIOD_M5);
-
-    if(g_mtlCount == 0) return true;
-    g_mtlActive = true;
-    for(int i = 0; i < g_mtlCount; i++) MTL_Backfill(i);
-    MTL_DrawPanel();
-    return true;
-}
-
-void MTL_Deinit() {
-    for(int i = 0; i < g_mtlCount; i++)
-        if(g_mtl[i].atrHandle != INVALID_HANDLE) IndicatorRelease(g_mtl[i].atrHandle);
-    for(int r = 0; r < MTL_MAX_TF + 4; r++) SafeDelete(OBJ_PREFIX + "mtlPanel_" + IntegerToString(r));
-    g_mtlActive = false;
-}
-
-void MTL_OnTick() {
-    if(!g_mtlActive) return;
-    bool any = false;
-    for(int i = 0; i < g_mtlCount; i++) {
-        if(!g_mtl[i].ready) { MTL_Backfill(i); continue; }
-        datetime t0 = iTime(_Symbol, g_mtl[i].tf, 0);
-        if(t0 == 0 || t0 == g_mtl[i].lastBar) continue;      // only on that TF's bar close
-        g_mtl[i].lastBar = t0;
-        MTL_ProcessBar(g_mtl[i], 1);
-        any = true;
-    }
-    if(any) { MTL_DrawPanel(); ChartRedraw(); }
-}
-
-//====================================================================
-//  v1.20/1.21 — INVALIDATION AUTO-TRACK (PER TIMEFRAME)
-//  Each scanned TF carries its own buy floor / sell ceiling (computed by
-//  MTL_ComputeInval and stored on the engine). They are drawn as per-TF
-//  lines; the context TF (InpInvalCtxTF) sets the trade gate in
-//  g_invalBuy / g_invalSell. The gate applies to TryEnter only.
-//====================================================================
-void DrawInvalPerTF() {
-    // clear legacy single-pair objects from older versions
-    SafeDelete(OBJ_PREFIX + "invalBuy");  SafeDelete(OBJ_PREFIX + "invalBuyTxt");
-    SafeDelete(OBJ_PREFIX + "invalSell"); SafeDelete(OBJ_PREFIX + "invalSellTxt");
-
-    ENUM_TIMEFRAMES ctx = (InpInvalCtxTF == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpInvalCtxTF;
-    datetime rightT = iTime(_Symbol, _Period, 0) + PeriodSeconds(_Period) * 6;
-    double   bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    double   ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-    for(int i = 0; i < g_mtlCount; i++) {
-        string tag = g_mtlTag[i];
-        string bn = OBJ_PREFIX + "invalB_" + tag;  string bt = OBJ_PREFIX + "invalBT_" + tag;
-        string sn = OBJ_PREFIX + "invalS_" + tag;  string st = OBJ_PREFIX + "invalST_" + tag;
-
-        bool show = (!InpShowCurrentTFOnly || g_mtl[i].tf == (ENUM_TIMEFRAMES)_Period);
-        if(!InpInvalEnable || !InpInvalDrawLines || !show) {
-            SafeDelete(bn); SafeDelete(bt); SafeDelete(sn); SafeDelete(st);
-            continue;
-        }
-        bool gate = (g_mtl[i].tf == ctx);
-        int  w    = gate ? 3 : 1;
-
-        if(g_mtl[i].invalBuy > 0.0) {
-            DrawHline(bn, g_mtl[i].invalBuy, InpInvalBuyColor, STYLE_DASHDOT, w);
-            DrawText(bt, rightT, g_mtl[i].invalBuy,
-                     tag + " BUY< " + DoubleToString(g_mtl[i].invalBuy, _Digits)
-                     + (gate ? " [GATE]" : "") + (bid <= g_mtl[i].invalBuy ? "  X" : ""),
-                     InpInvalBuyColor, 8, ANCHOR_LEFT);
-        } else { SafeDelete(bn); SafeDelete(bt); }
-
-        if(g_mtl[i].invalSell > 0.0) {
-            DrawHline(sn, g_mtl[i].invalSell, InpInvalSellColor, STYLE_DASHDOT, w);
-            DrawText(st, rightT, g_mtl[i].invalSell,
-                     tag + " SELL> " + DoubleToString(g_mtl[i].invalSell, _Digits)
-                     + (gate ? " [GATE]" : "") + (ask >= g_mtl[i].invalSell ? "  X" : ""),
-                     InpInvalSellColor, 8, ANCHOR_LEFT);
-        } else { SafeDelete(sn); SafeDelete(st); }
-    }
-}
-
-void UpdateInvalLevels() {
-    // refresh every engine's own levels
-    for(int i = 0; i < g_mtlCount; i++) MTL_ComputeInval(g_mtl[i]);
-
-    DrawInvalPerTF();
-
-    if(!InpInvalEnable) { g_invalBuy = 0.0; g_invalSell = 0.0; g_invalSrc = ""; return; }
-
-    // the trade gate uses the context TF's level
-    ENUM_TIMEFRAMES ctx = (InpInvalCtxTF == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpInvalCtxTF;
-    string ctxTag = StringSubstr(EnumToString(ctx), 7);
-    bool found = false;
-    for(int i = 0; i < g_mtlCount; i++)
-        if(g_mtl[i].tf == ctx) {
-            g_invalBuy  = g_mtl[i].invalBuy;
-            g_invalSell = g_mtl[i].invalSell;
-            found = true;
-            break;
-        }
-    if(!found) {                       // context TF not scanned — fall back to chart TF
-        MTLEngine tmp; ZeroMemory(tmp);
-        tmp.tf = (ENUM_TIMEFRAMES)_Period; tmp.atrHandle = g_atr14Handle;
-        tmp.lower = g_lowerTL; tmp.upper = g_upperTL;
-        tmp.plVal = g_swingLow.currentLevel; tmp.phVal = g_swingHigh.currentLevel;
-        MTL_ComputeInval(tmp);
-        g_invalBuy = tmp.invalBuy; g_invalSell = tmp.invalSell;
-        ctxTag += "*";
-    }
-
-    string srcName = (InpInvalSource == INVAL_MANUAL)    ? "manual"
-                   : (InpInvalSource == INVAL_SWING)     ? "struct"
-                   : (InpInvalSource == INVAL_TRENDLINE) ? "TL"
-                   : (InpInvalSource == INVAL_SNR)       ? "S/R"
-                                                         : "TL+struct";
-    g_invalSrc = srcName + " " + ctxTag + " [gate]";
+                ArraySize(g_swingOBs), ArraySize(g_internalOBs), ArraySize(g_fvgs));
 }
 
 //===================== ONINIT / ONDEINIT ============================
@@ -3429,31 +2190,51 @@ int OnInit() {
     ArrayResize(g_swingOBs, 0);
     ArrayResize(g_internalOBs, 0);
     ArrayResize(g_fvgs, 0);
-    ArrayResize(g_lqTargets, 0);   // v1.22
 
-    //---- v1.12 state reset ----
-    ArrayResize(g_res, 0);
-    ArrayResize(g_sup, 0);
-    ArrayResize(g_zz,  0);
-    g_zzSegments  = 0;
-    g_lastRawType = 0;
-    g_lastRawTime = 0;
-
-    g_tlPhVal = 0.0; g_tlPhVal1 = 0.0; g_tlPhTime = 0; g_tlPhTime1 = 0;
-    g_tlPlVal = 0.0; g_tlPlVal1 = 0.0; g_tlPlTime = 0; g_tlPlTime1 = 0;
-
-    ZeroMemory(g_upperTL);
-    ZeroMemory(g_lowerTL);
-    g_prevUpVal = 0.0; g_prevLoVal = 0.0;
-    g_hadUpPrev = false; g_hadLoPrev = false;
-    g_tlBreakCounter = 0;
-
-    if(InpSnRPeriod < 1 || InpTLPeriod < 1) {
-        Print("[SMC] S/R and trendline periods must be >= 1");
-        return INIT_PARAMETERS_INCORRECT;
+    // v1.12: init MTF dashboard rows
+    g_mtf[0].tf = InpMTF1; g_mtf[1].tf = InpMTF2;
+    g_mtf[2].tf = InpMTF3; g_mtf[3].tf = InpMTF4;
+    for(int i = 0; i < MTF_COUNT; i++) {
+        g_mtf[i].tag          = TFName(g_mtf[i].tf);
+        g_mtf[i].valid        = false;
+        g_mtf[i].state        = MTF_NONE;
+        g_mtf[i].lastReactBar = 0;
     }
 
-    // ATR buffer needs a moment to populate after handle creation.
+    // v1.13: build the tracked-timeframe list = MTF rows + (optional) current chart row.
+    g_liqTFCount = 0;
+    g_liqCurRow  = -1;
+    for(int i = 0; i < MTF_COUNT; i++) {
+        g_liqTF[g_liqTFCount] = g_mtf[i].tf;
+        if(g_mtf[i].tf == _Period) g_liqCurRow = g_liqTFCount;   // chart TF already in the MTF set
+        g_liqTFCount++;
+    }
+    if(InpLiqIncludeCurrent && g_liqCurRow < 0) {                 // add the chart TF as its own row
+        g_liqTF[g_liqTFCount] = _Period;
+        g_liqCurRow = g_liqTFCount;
+        g_liqTFCount++;
+    }
+
+    // init every slot in the list
+    for(int k = 0; k < g_liqTFCount; k++) {
+        for(int ch = 0; ch < LIQ_CH_COUNT; ch++) {
+            g_liq[k][ch].tf          = g_liqTF[k];
+            g_liq[k][ch].tag         = TFName(g_liqTF[k]);
+            g_liq[k][ch].internalCh  = (ch == 0);
+            g_liq[k][ch].active      = false;
+            g_liq[k][ch].state       = SEQ_IDLE;
+            g_liq[k][ch].dir         = 0;
+            g_liq[k][ch].induceSwept = false;
+            g_liq[k][ch].obValid     = false;
+            g_liq[k][ch].aBreak      = 0;
+            g_liq[k][ch].aMit        = 0;
+            g_liq[k][ch].aCont       = 0;
+        }
+    }
+
+    // ATR buffer needs a moment to populate after handle creation. Wait briefly
+    // (especially important on slow brokers / fresh symbol load) so backfill
+    // doesn't run with GetATR returning 0.
     if(InpBackfillOnInit) {
         int waitMs = 0;
         double atrCheck[];
@@ -3464,6 +2245,8 @@ int OnInit() {
         }
         BackfillHistory();
 
+        // Final draw passes: now that g_scanShift == 0, the right edges
+        // anchor to the live "now" instead of to historical scan positions.
         if(InpShowInternalOBs)   DrawOrderBlocks(true);
         if(InpShowSwingOBs)      DrawOrderBlocks(false);
         if(InpShowHighLowSwings) DrawHighLowSwings();
@@ -3471,21 +2254,20 @@ int OnInit() {
         if(InpShowDaily)   DrawMTFLevels(PERIOD_D1, "D", InpDailyStyle,   InpDailyColor);
         if(InpShowWeekly)  DrawMTFLevels(PERIOD_W1, "W", InpWeeklyStyle,  InpWeeklyColor);
         if(InpShowMonthly) DrawMTFLevels(PERIOD_MN1,"M", InpMonthlyStyle, InpMonthlyColor);
-        DrawSmartSnRAll();   // v1.12
         ChartRedraw();
     }
 
-    // v1.13–1.17 — Failed-CHoCH sell+buy scanner (own per-TF backfill).
-    if(!FBC_Init()) return INIT_FAILED;
+    // v1.12: first MTF pass (no reaction alerts on load — just populate the panel)
+    if(InpShowMTFPanel) {
+        UpdateMTF(false);
+        ChartRedraw();
+    }
 
-    // v1.18 — MTF trendline status table (own per-TF backfill).
-    MTL_Init();
-
-    // v1.21 — per-TF invalidation levels (engines now exist)
-    UpdateInvalLevels();
-
-    // v1.22/1.23 — per-TF liquidity sweep engines
-    LST_Init();
+    // v1.13: first liquidity-sequence pass (record state, no alerts on load)
+    if(InpLiqEnable) {
+        UpdateLiq(false);
+        ChartRedraw();
+    }
 
     EventSetTimer(15);
     Print("[SMC] EA initialized on ", _Symbol, " ", EnumToString(_Period));
@@ -3496,10 +2278,7 @@ void OnDeinit(const int reason) {
     EventKillTimer();
     if(g_atrHandle   != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
     if(g_atr14Handle != INVALID_HANDLE) IndicatorRelease(g_atr14Handle);
-    FBC_Deinit();   // v1.13
-    MTL_Deinit();   // v1.18
-    LST_Deinit();   // v1.23
-    DeleteByPrefix(OBJ_PREFIX);
+    DeleteByPrefix(OBJ_PREFIX);   // also removes pnl_* dashboard objects
     ChartRedraw();
 }
 
@@ -3511,43 +2290,28 @@ void OnTimer() {
     if(InpShowFVG)         DeleteFairValueGaps();
     ManageOpenPositions();
 
-    // v1.12 — keep the projected trendline price / dashboard live between bars.
-    if(InpShowTrendlines || InpShowDashboard) {
-        DrawTrendlinesOnChart();
-        DrawSnRDashboard();
+    // v1.12: keep the MTF panel levels + price fresh between chart bars.
+    // Reaction alerts are NOT fired here (they must evaluate a closed chart bar),
+    // so pass evaluateReactions = false.
+    if(InpShowMTFPanel) {
+        UpdateMTF(false);
         ChartRedraw();
     }
-
-    // v1.13 — keep the failed-CHoCH panel / armed lines current.
-    FBC_DrawPanel();
-
-    // v1.18 — keep the MTF trendline table's projected values current.
-    MTL_DrawPanel();
-
-    // v1.19–1.21 — refresh per-TF invalidation levels (intrabar)
-    UpdateInvalLevels();
 }
 
 //===================== ONTICK =======================================
 void OnTick() {
-    // v1.13 — runs its own per-TF new-bar checks, so it goes BEFORE the
-    // chart-TF early return below.
-    FBC_OnTick();
-
-    // v1.18 — MTF trendline table (own per-TF new-bar checks).
-    MTL_OnTick();
-
     bool newBar = IsNewBar();
     if(!newBar && !InpProcessOnTick) {
+        // still manage positions on every tick if trailing is on
         if(InpEnableTrading) ManageOpenPositions();
         return;
     }
 
-    // Warm-up guard — v1.12 also accounts for the S/R and TL pivot windows.
-    int warmup = MathMax(250, MathMax(InpSwingsLength + 50,
-                                      2 * MathMax(InpSnRPeriod, InpTLPeriod) + 10));
-    if(Bars(_Symbol, _Period) < warmup) return;
+    // Warm-up guard
+    if(Bars(_Symbol, _Period) < MathMax(250, InpSwingsLength + 50)) return;
 
+    // Anchor for "initial time"
     if(g_initialTime == 0) g_initialTime = T(0);
 
     ResetAlerts();
@@ -3586,13 +2350,6 @@ void OnTick() {
         if(InpShowPDZones)       DrawPremiumDiscountZones();
     }
 
-    // v1.12 — Smart S/R + trendlines (state, then draw)
-    UpdateSmartSnR();
-    DrawSmartSnRAll();
-
-    // v1.19–1.21 — per-TF invalidation levels (recompute + draw)
-    UpdateInvalLevels();
-
     // MTF levels
     if(InpShowDaily)   DrawMTFLevels(PERIOD_D1, "D", InpDailyStyle,   InpDailyColor);
     if(InpShowWeekly)  DrawMTFLevels(PERIOD_W1, "W", InpWeeklyStyle,  InpWeeklyColor);
@@ -3601,9 +2358,11 @@ void OnTick() {
     // Alerts
     DispatchAlerts();
 
-    // v1.22/1.23 — per-TF liquidity sweep detection, then chart-based mgmt + draw
-    LST_OnTick();
-    ProcessLiquiditySweeps(true);
+    // v1.12: MTF strong/weak dashboard + reaction detection on the closed chart bar
+    if(InpShowMTFPanel) UpdateMTF(true);
+
+    // v1.13: liquidity-sequence tracker on the closed chart bar (alerts allowed)
+    if(InpLiqEnable) UpdateLiq(true);
 
     // Trading
     if(InpEnableTrading) {
@@ -3613,5 +2372,3 @@ void OnTick() {
 
     ChartRedraw();
 }
-
-//+------------------------------------------------------------------+
